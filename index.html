@@ -840,7 +840,7 @@ function viewNova(){
   const n = state.novo;
   const selectedType = state.types.find((t) => t.id === n.typeId);
   const fields = parseFields(selectedType && selectedType.fields);
-  const depUsers = state.profiles.filter((p) => !n.target || p.department_id === n.target);
+  const depUsers = state.profiles;
   const typeOpts = '<option value="">Livre (sem formulário)</option>'+
     state.types.filter((t) => t.is_active).map((t) => '<option value="'+t.id+'"'+(t.id===n.typeId?" selected":"")+'>'+esc(t.name)+'</option>').join("");
   const depOpts = '<option value="">Selecione</option>'+
@@ -1187,7 +1187,7 @@ function viewDetalhe(id){
   const type = state.types.find((t) => t.id === r.request_type_id);
   const fields = parseFields(type && type.fields);
   const answers = r.form_data || {};
-  const depUsers = state.profiles.filter((p) => p.department_id === r.target_department_id);
+  const depUsers = state.profiles;
   const statusOpts = statusOptionsFor(r);
   const prioOpts = Object.entries(PRIORITY_LABEL).map(([v,l]) => '<option value="'+v+'"'+(v===r.priority?" selected":"")+'>'+l+'</option>').join("");
   const userOpts = '<option value="">Não definido</option>'+depUsers.map((p) => '<option value="'+p.id+'"'+(p.id===r.assignee_id?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("");
@@ -1230,7 +1230,9 @@ function viewDetalhe(id){
       '</section>'+
     '</div>'+
     '<aside class="space-y-4 rounded-xl border border-border bg-card p-6 shadow-card h-fit">'+
-      field("Solicitante", nameById(r.requester_id))+
+      '<div><label class="lbl">Solicitante</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{requester_id:this.value||null})">'+
+        '<option value="">Não definido</option>'+depUsers.map((p) => '<option value="'+p.id+'"'+(p.id===r.requester_id?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("")+
+      '</select></div>'+
       field("Departamento solicitante", r.requester_department_id ? depById(r.requester_department_id) : "—")+
       field("Departamento solicitado", depById(r.target_department_id))+
       field("Tipo", type ? (type.name + (type.tag ? " · "+type.tag : "")) : "Livre")+
@@ -1271,7 +1273,7 @@ async function comentar(id){
 function viewTipos(){
   const t = state.tipos;
   const depOpts = '<option value="">Selecione</option>'+state.departments.map((d) => '<option value="'+d.id+'"'+(d.id===t.departmentId?" selected":"")+'>'+esc(d.name)+'</option>').join("");
-  const ownerCandidates = t.departmentId ? state.profiles.filter((p) => p.department_id === t.departmentId) : state.profiles;
+  const ownerCandidates = state.profiles;
   const ownerOpts = '<option value="">Selecione</option>'+ownerCandidates.map((p) => '<option value="'+p.id+'"'+(p.id===t.ownerId?" selected":"")+'>'+esc(p.full_name || p.email)+' ('+esc(p.email)+')</option>').join("");
   const camposHtml = t.fields.length === 0
     ? '<p class="text-xs text-muted-foreground">Nenhum campo extra. O tipo usará apenas título e descrição.</p>'
