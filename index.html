@@ -421,7 +421,7 @@ const state = {
   agenda: { showForm: false, showDone: false, viewUserId: "" },
   painelExpanded: {},
   novo: { typeId: "", target: "", title: "", priority: "media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee: "", formData: {}, files: {} },
-  tipos: { name: "", description: "", departmentId: "", ownerId: "", sla: DEFAULT_SLA_BUSINESS_DAYS, tag: "", fields: [], needsFiscal: false, fiscalAssigneeId: "" },
+  tipos: { editingId: null, name: "", description: "", departmentId: "", ownerId: "", sla: DEFAULT_SLA_BUSINESS_DAYS, tag: "", fields: [], needsFiscal: false, fiscalAssigneeId: "" },
   pessoa: { editingId: null, name: "", email: "", active: true },
   departamento: { name: "" },
   detalhe: { request: null, comments: [], comment: "", loading: false },
@@ -508,6 +508,12 @@ window.addEventListener("hashchange", render);
 
 const PROTECTED = ["/painel","/nova","/agenda","/relatorios","/tipos","/solicitacao","/acompanhamento","/pessoas"];
 
+let __filterDebounceTimer = null;
+function debouncedFilter(field, value, delay){
+  state.filters[field] = value;
+  clearTimeout(__filterDebounceTimer);
+  __filterDebounceTimer = setTimeout(render, delay || 350);
+}
 async function render(){
   const path = route();
   const app = document.getElementById("app");
@@ -527,7 +533,25 @@ async function render(){
   else if(path.startsWith("/pessoas")) inner = state.isMaster ? viewPessoas() : '<p class="text-sm text-muted-foreground">Somente o acesso master pode acessar a base de dados cadastral.</p>';
   else if(path.startsWith("/solicitacao/")) inner = viewDetalhe(path.split("/")[2]);
   else inner = '<p class="text-sm text-muted-foreground">Página não encontrada.</p>';
+
+  // Preserva foco e posição do cursor de um campo de texto sendo editado (o
+  // render reconstrói o HTML inteiro, então sem isso o campo perderia o foco).
+  const active = document.activeElement;
+  const activeId = active && active.id;
+  const selStart = active && "selectionStart" in active ? active.selectionStart : null;
+  const selEnd = active && "selectionEnd" in active ? active.selectionEnd : null;
+
   app.innerHTML = shell(inner, path);
+
+  if(activeId){
+    const el = document.getElementById(activeId);
+    if(el){
+      el.focus();
+      if(selStart != null && "setSelectionRange" in el){
+        try{ el.setSelectionRange(selStart, selEnd); }catch(_){}
+      }
+    }
+  }
 }
 
 /* ============================ Shell ============================ */
@@ -683,7 +707,7 @@ function viewPainel(){
     state.profiles.map((p) => '<option value="'+p.id+'"'+(p.id===state.filters.painelAssignee?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("");
   const filterBar = '<div class="mt-4 flex flex-wrap items-center gap-2">'+
     '<div class="relative w-56"><span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
-      '<input class="inp pl-8" placeholder="Buscar por número (#0001)" value="'+esc(state.filters.painelSearch)+'" oninput="state.filters.painelSearch=this.value;render()" /></div>'+
+      '<input id="painelSearchInput" class="inp pl-8" placeholder="Buscar por número (#0001)" value="'+esc(state.filters.painelSearch)+'" oninput="debouncedFilter(\'painelSearch\',this.value)" /></div>'+
     '<select class="inp w-52" onchange="state.filters.painelDep=this.value;render()">'+depOpts+'</select>'+
     '<select class="inp w-48" onchange="state.filters.painelPeriod=this.value;render()">'+periodOpts+'</select>'+
     '<select class="inp w-48" onchange="state.filters.painelTag=this.value;render()">'+tagOpts+'</select>'+
@@ -778,7 +802,11 @@ function viewAcompanhamento(){
     '<p class="text-xs font-medium tracking-wide text-muted-foreground uppercase">'+label+'</p>'+
     '<p class="mt-2 font-display text-3xl font-bold '+(tone==="destructive"?"text-destructive":"")+'">'+value+'</p></div>';
 
-  const rows = mine.length ? mine.map((r) => {
+  const ACOMP_CAP = 40;
+  const acompExpanded = !!state.painelExpanded.__acomp;
+  const visibleMine = acompExpanded ? mine : mine.slice(0, ACOMP_CAP);
+  const hiddenMine = mine.length - visibleMine.length;
+  const rows = mine.length ? visibleMine.map((r) => {
     const diff = daysUntil(r.due_date);
     const late = r.status !== "concluida" && r.status !== "cancelada" && diff !== null && diff < 0;
     return '<a href="#/solicitacao/'+r.id+'" class="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card hover:border-ring">'+
@@ -789,7 +817,10 @@ function viewAcompanhamento(){
       '<span class="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-secondary-foreground">'+STATUS_LABEL[r.status]+'</span>'+
       '<span class="text-[11px] font-medium '+(late?"text-destructive":"text-muted-foreground")+'">'+deadlineLabel(r.due_date, r.status)+'</span>'+
     '</a>';
-  }).join("") : '<p class="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Nenhuma solicitação encontrada.</p>';
+  }).join("") + (hiddenMine > 0
+      ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2.5 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded.__acomp=true;render()">Mostrar todas as '+mine.length+' (+'+hiddenMine+')</button>'
+      : "")
+    : '<p class="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Nenhuma solicitação encontrada.</p>';
 
   return '<div class="mx-auto max-w-4xl">'+
     '<div class="flex flex-wrap items-end justify-between gap-4">'+
@@ -1024,18 +1055,31 @@ function viewAgenda(){
         '<button type="submit" class="btn btn-primary">Adicionar</button></div>'+
     '</form>' : "";
 
+  const AGENDA_CAP = 40;
   const todoEmpty = '<p class="py-6 text-center text-sm text-muted-foreground">Nada para hoje. 🎉</p>';
+  const hojeExpanded = !!state.painelExpanded.__agendaHoje;
+  const visibleToday = hojeExpanded ? todayItems : todayItems.slice(0, AGENDA_CAP);
+  const hiddenToday = todayItems.length - visibleToday.length;
   const todoList = todayItems.length ? '<ul class="space-y-2">'+
-      todayItems.map((item) => item.kind === "request" ? agendaRequestItem(item.request, item.overdue) : agendaTodoItem(item.task, item.overdue, viewingOther)).join("")+
+      visibleToday.map((item) => item.kind === "request" ? agendaRequestItem(item.request, item.overdue) : agendaTodoItem(item.task, item.overdue, viewingOther)).join("")+
+      (hiddenToday > 0 ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded.__agendaHoje=true;render()">Mostrar todos os '+todayItems.length+' (+'+hiddenToday+')</button>' : "")+
     '</ul>' : todoEmpty;
 
   const empty = groups.length === 0 ? "" : "";
-  const body = groups.map(([groupDate, list]) => '<section>'+
+  const body = groups.map(([groupDate, list]) => {
+    const key = "__agendaGroup_"+groupDate;
+    const groupExpanded = !!state.painelExpanded[key];
+    const visibleList = groupExpanded ? list : list.slice(0, AGENDA_CAP);
+    const hiddenList = list.length - visibleList.length;
+    return '<section>'+
     '<header class="flex items-baseline gap-3 border-b border-border pb-2">'+
       '<h2 class="font-display text-sm font-semibold capitalize">'+dayLabel(groupDate)+'</h2>'+
       '<span class="text-xs text-muted-foreground">'+list.length+' itens</span></header>'+
-    '<ul class="mt-3 space-y-2">'+list.map((item) => item.kind === "request" ? agendaRequestItem(item.request, item.overdue) : agendaTaskItem(item.task, item.overdue, viewingOther)).join("")+'</ul>'+
-  '</section>').join("");
+    '<ul class="mt-3 space-y-2">'+visibleList.map((item) => item.kind === "request" ? agendaRequestItem(item.request, item.overdue) : agendaTaskItem(item.task, item.overdue, viewingOther)).join("")+
+      (hiddenList > 0 ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded[\''+key+'\']=true;render()">Mostrar todos os '+list.length+' (+'+hiddenList+')</button>' : "")+
+    '</ul>'+
+  '</section>';
+  }).join("");
 
   return '<div class="mx-auto max-w-4xl">'+
     '<div class="flex flex-wrap items-end justify-between gap-4">'+
@@ -1256,6 +1300,7 @@ function viewTipos(){
       '</div>'+
       (ty.description ? '<p class="mt-2 text-sm text-muted-foreground">'+esc(ty.description)+'</p>' : "")+
       '<div class="mt-3 flex flex-wrap gap-1.5">'+parseFields(ty.fields).map((f) => '<span class="rounded-full bg-secondary px-2.5 py-0.5 text-[11px] text-secondary-foreground">'+esc(f.label)+(f.required?" *":"")+'</span>').join("")+'</div>'+
+      (state.isMaster ? '<button type="button" class="btn btn-outline btn-sm mt-3" onclick="editarTipo(\''+ty.id+'\')">Editar</button>' : "")+
     '</div>').join("")
     : '<p class="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">Nenhum tipo cadastrado ainda.</p>';
 
@@ -1264,7 +1309,7 @@ function viewTipos(){
     (!state.isMaster ? '<p class="mt-6 rounded-lg border border-border bg-surface p-4 text-sm text-muted-foreground">Você pode consultar os tipos existentes. A criação e edição são restritas ao acesso master.</p>' : "")+
     '<div class="mt-8 grid gap-6 lg:grid-cols-2">'+
       '<form onsubmit="return criarTipo(event)" class="space-y-5 rounded-xl border border-border bg-card p-6 shadow-card h-fit">'+
-        '<h2 class="text-sm font-semibold">Novo tipo</h2>'+
+        '<h2 class="text-sm font-semibold">'+(t.editingId ? "Editar tipo" : "Novo tipo")+'</h2>'+
         '<div><label class="lbl">Nome</label><input class="inp" maxlength="80" value="'+esc(t.name)+'" placeholder="Ex: Solicitação de compra" oninput="state.tipos.name=this.value" /></div>'+
         '<div><label class="lbl">Descrição</label><textarea class="inp" rows="2" maxlength="500" oninput="state.tipos.description=this.value">'+esc(t.description)+'</textarea></div>'+
         '<div class="grid gap-4 sm:grid-cols-2">'+
@@ -1288,7 +1333,10 @@ function viewTipos(){
             '<button type="button" class="btn btn-outline btn-sm" onclick="addField()">'+I.plus+' Campo</button></div>'+
           camposHtml+
         '</div>'+
-        '<button type="submit" class="btn btn-primary w-full"'+(state.isMaster?"":" disabled")+'>Criar tipo</button>'+
+        '<div class="flex gap-2">'+
+          (t.editingId ? '<button type="button" class="btn btn-ghost" onclick="cancelarEdicaoTipo()">Cancelar</button>' : "")+
+          '<button type="submit" class="btn btn-primary flex-1"'+(state.isMaster?"":" disabled")+'>'+(t.editingId ? "Salvar alterações" : "Criar tipo")+'</button>'+
+        '</div>'+
       '</form>'+
       '<div class="space-y-3">'+lista+'</div>'+
     '</div></div>';
@@ -1296,6 +1344,23 @@ function viewTipos(){
 function addField(){ state.tipos.fields.push({ id: Math.random().toString(36).slice(2,10), label:"", type:"text", required:false }); render(); }
 function removeField(i){ state.tipos.fields.splice(i,1); render(); }
 function patchField(i, patch, rerender){ Object.assign(state.tipos.fields[i], patch); if(rerender) render(); }
+function editarTipo(id){
+  const ty = state.types.find((x) => x.id === id);
+  if(!ty) return;
+  state.tipos = {
+    editingId: ty.id, name: ty.name || "", description: ty.description || "",
+    departmentId: ty.department_id || "", ownerId: ty.owner_id || "",
+    sla: ty.default_sla_days || DEFAULT_SLA_BUSINESS_DAYS, tag: ty.tag || "",
+    fields: parseFields(ty.fields).map((f) => ({ id:f.id, label:f.label, type:f.type, required:!!f.required, options:f.options||[] })),
+    needsFiscal: !!ty.needs_fiscal_registration, fiscalAssigneeId: ty.fiscal_assignee_id || "",
+  };
+  window.scrollTo(0,0);
+  render();
+}
+function cancelarEdicaoTipo(){
+  state.tipos = { editingId:null, name:"", description:"", departmentId:"", ownerId:"", sla:DEFAULT_SLA_BUSINESS_DAYS, tag:"", fields:[], needsFiscal:false, fiscalAssigneeId:"" };
+  render();
+}
 async function criarTipo(e){
   e.preventDefault();
   const t = state.tipos;
@@ -1303,15 +1368,18 @@ async function criarTipo(e){
   if(!t.departmentId) return err("Selecione o departamento responsável."), false;
   if(t.fields.some((f) => f.label.trim().length === 0)) return err("Todos os campos precisam de um nome."), false;
   if(t.needsFiscal && !t.fiscalAssigneeId) return err("Selecione o responsável pelo cadastro fiscal."), false;
-  const { error } = await sb.from("request_types").insert({
+  const payload = {
     name: t.name.trim(), description: t.description.trim(), department_id: t.departmentId,
-    default_sla_days: t.sla, owner_id: t.ownerId || null, tag: t.tag.trim() || null, is_active: true,
+    default_sla_days: t.sla, owner_id: t.ownerId || null, tag: t.tag.trim() || null,
     needs_fiscal_registration: t.needsFiscal, fiscal_assignee_id: t.needsFiscal ? t.fiscalAssigneeId : null,
-    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[] })), created_by: state.user.id,
-  });
-  if(error){ err("Somente o acesso master pode criar tipos."); return false; }
-  state.tipos = { name:"", description:"", departmentId:"", ownerId:"", sla:DEFAULT_SLA_BUSINESS_DAYS, tag:"", fields:[], needsFiscal:false, fiscalAssigneeId:"" };
-  await refreshTypes(); ok("Tipo de solicitação criado."); render();
+    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[] })),
+  };
+  const { error } = t.editingId
+    ? await sb.from("request_types").update(payload).eq("id", t.editingId)
+    : await sb.from("request_types").insert(Object.assign({ is_active: true, created_by: state.user.id }, payload));
+  if(error){ err(t.editingId ? "Não foi possível salvar as alterações." : "Somente o acesso master pode criar tipos."); return false; }
+  state.tipos = { editingId:null, name:"", description:"", departmentId:"", ownerId:"", sla:DEFAULT_SLA_BUSINESS_DAYS, tag:"", fields:[], needsFiscal:false, fiscalAssigneeId:"" };
+  await refreshTypes(); ok(t.editingId ? "Tipo atualizado." : "Tipo de solicitação criado."); render();
   return false;
 }
 async function toggleTipo(id, value){
@@ -1378,6 +1446,21 @@ function viewPessoas(){
         '</tr>').join("")+
         '</tbody></table></div>'+
     '</section>'+
+    '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<h2 class="text-sm font-semibold">Mesclar perfis duplicados</h2>'+
+      '<p class="mt-1 text-xs text-muted-foreground">Se a mesma pessoa aparece duas vezes na lista (ex: criou acesso com grafia diferente do nome importado), '+
+      'use isto para juntar os dois: escolha qual perfil manter e qual remover. Tudo que estiver no perfil removido '+
+      '(solicitações, comentários, tipos, tarefas) é automaticamente transferido para o perfil mantido.</p>'+
+      '<div class="mt-4 grid gap-3 sm:grid-cols-2">'+
+        '<div><label class="lbl">Manter este perfil</label><select class="inp" id="mesclarManter">'+
+          state.profiles.map((pr) => '<option value="'+pr.id+'">'+esc(pr.full_name||"—")+' — '+esc(pr.email)+'</option>').join("")+
+        '</select></div>'+
+        '<div><label class="lbl">Remover este perfil (será apagado)</label><select class="inp" id="mesclarRemover">'+
+          state.profiles.map((pr) => '<option value="'+pr.id+'">'+esc(pr.full_name||"—")+' — '+esc(pr.email)+'</option>').join("")+
+        '</select></div>'+
+      '</div>'+
+      '<button type="button" class="btn btn-outline mt-4" onclick="mesclarPerfis(document.getElementById(\'mesclarManter\').value, document.getElementById(\'mesclarRemover\').value)">Mesclar perfis</button>'+
+    '</section>'+
   '</div>';
 }
 function editarPessoa(id){
@@ -1433,6 +1516,55 @@ async function toggleRole(userId, role, grant){
   await refreshRoles();
   if(userId === state.user.id){ state.isMaster = hasRole(userId,"master"); }
   ok("Papéis atualizados."); render();
+}
+
+async function mesclarPerfis(keepId, removeId){
+  if(!keepId || !removeId) return err("Selecione os dois perfis.");
+  if(keepId === removeId) return err("Selecione dois perfis diferentes.");
+  const keep = state.profiles.find((p) => p.id === keepId);
+  const remove = state.profiles.find((p) => p.id === removeId);
+  if(!keep || !remove) return err("Perfil não encontrado.");
+  if(!confirm('Mesclar "'+remove.full_name+'" ('+remove.email+') dentro de "'+keep.full_name+'" ('+keep.email+')?\n\n'+
+    'Tudo que hoje está com '+remove.full_name+' (solicitações, comentários, tipos, tarefas) passa para '+keep.full_name+
+    ', e o perfil "'+remove.full_name+'" é apagado.\n\nEssa ação não pode ser desfeita.')) return;
+
+  try{
+    async function reassign(collection, field){
+      const snap = await fbDb.collection(collection).where(field, "==", removeId).get();
+      for(let i=0;i<snap.docs.length;i+=400){
+        const group = snap.docs.slice(i, i+400);
+        const batch = fbDb.batch();
+        group.forEach((d) => batch.set(d.ref, { [field]: keepId }, { merge:true }));
+        await batch.commit();
+      }
+      return snap.docs.length;
+    }
+
+    const counts = {
+      "solicitações (responsável)": await reassign("requests", "assignee_id"),
+      "solicitações (solicitante)": await reassign("requests", "requester_id"),
+      "comentários": await reassign("request_comments", "author_id"),
+      "tipos (responsável)": await reassign("request_types", "owner_id"),
+      "tipos (cadastro fiscal)": await reassign("request_types", "fiscal_assignee_id"),
+      "tarefas da agenda": await reassign("personal_tasks", "user_id"),
+    };
+
+    const rolesSnap = await fbDb.collection("user_roles").where("user_id","==",removeId).get();
+    for(const d of rolesSnap.docs){
+      const role = d.data().role;
+      await fbDb.collection("user_roles").doc(keepId+"_"+role).set({ user_id: keepId, role }, { merge:true });
+      await d.ref.delete();
+    }
+
+    await fbDb.collection("profiles").doc(removeId).delete();
+
+    const total = Object.values(counts).reduce((a,b) => a+b, 0);
+    await loadCore();
+    ok('Mesclado: '+total+' registro(s) movidos de "'+remove.full_name+'" para "'+keep.full_name+'". Perfil duplicado removido.');
+    render();
+  } catch(e){
+    err("Erro ao mesclar perfis: "+(e.message || e));
+  }
 }
 
 /* ============================ Relatórios ============================ */
