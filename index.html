@@ -388,6 +388,7 @@ const I = {
   clipboardCheck:'<svg class="icon" viewBox="0 0 24 24"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M9 14l2 2 4-4"/></svg>',
   idCard:'<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="8" cy="12" r="2"/><path d="M14 10h6M14 14h4"/></svg>',
   paperclip:'<svg class="icon" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a1.5 1.5 0 0 1-2.12-2.12l8.49-8.48"/></svg>',
+  mail:'<svg class="icon" viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 6-10 7L2 6"/></svg>',
 };
 
 /* ============================ Toasts ============================ */
@@ -413,7 +414,7 @@ const isHardcodedMaster = (email) => MASTER_EMAILS.includes(String(email||"").tr
 /* ============================ Estado / dados ============================ */
 const state = {
   user: null, profile: null, isMaster: false,
-  departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [],
+  departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {},
   filters: {
     painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
     relPeriod: "90", relDep: "todos", agendaRange: "todos", acompStatus: "todos",
@@ -452,6 +453,7 @@ async function loadCore(){
     state.tasks = tasks.data || [];
     state.isMaster = (roles.data || []).some((r) => r.role === "master") || isHardcodedMaster(state.user.email);
     await refreshRoles();
+    if(state.isMaster) await refreshEmailStatus();
   }
 }
 async function refreshRoles(){
@@ -477,6 +479,24 @@ async function refreshPessoas(){
 async function refreshSettings(){
   const { data } = await sb.from("app_settings").select("*");
   state.settings = Object.fromEntries((data || []).map((s) => [s.key, s.value]));
+}
+
+/* ============================ Serviço de e-mails (Google Apps Script) ============================ */
+async function callEmailService(action, payload){
+  const url = state.settings.email_gas_url;
+  const secret = state.settings.email_shared_secret;
+  if(!url || !secret) return { ok:false, error:"not_configured" };
+  try{
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" }, // evita preflight CORS no Apps Script
+      body: JSON.stringify({ secret, action, payload }),
+    });
+    const data = await res.json();
+    return data;
+  } catch(e){
+    return { ok:false, error: e.message || String(e) };
+  }
 }
 async function refreshRequests(){
   const { data } = await sb.from("requests").select("*").order("created_at", { ascending:false });
@@ -506,7 +526,7 @@ function route(){ return (location.hash || "#/").slice(1); }
 function go(path){ location.hash = path; }
 window.addEventListener("hashchange", render);
 
-const PROTECTED = ["/painel","/nova","/agenda","/relatorios","/tipos","/solicitacao","/acompanhamento","/pessoas"];
+const PROTECTED = ["/painel","/nova","/agenda","/relatorios","/tipos","/solicitacao","/acompanhamento","/pessoas","/configuracoes"];
 
 let __filterDebounceTimer = null;
 function debouncedFilter(field, value, delay){
@@ -531,6 +551,7 @@ async function render(){
   else if(path.startsWith("/relatorios")) inner = viewRelatorios();
   else if(path.startsWith("/tipos")) inner = viewTipos();
   else if(path.startsWith("/pessoas")) inner = state.isMaster ? viewPessoas() : '<p class="text-sm text-muted-foreground">Somente o acesso master pode acessar a base de dados cadastral.</p>';
+  else if(path.startsWith("/configuracoes")) inner = state.isMaster ? viewConfiguracoes() : '<p class="text-sm text-muted-foreground">Somente o acesso master pode acessar as configurações.</p>';
   else if(path.startsWith("/solicitacao/")) inner = viewDetalhe(path.split("/")[2]);
   else inner = '<p class="text-sm text-muted-foreground">Página não encontrada.</p>';
 
@@ -564,7 +585,7 @@ const NAV = [
   { to:"/tipos", label:"Tipos de solicitação", icon:I.settings },
 ];
 function shell(children, path){
-  const nav = NAV.concat(state.isMaster ? [{ to:"/pessoas", label:"Cadastro de pessoas", icon:I.idCard }] : []).map((item) => {
+  const nav = NAV.concat(state.isMaster ? [{ to:"/pessoas", label:"Cadastro de pessoas", icon:I.idCard }, { to:"/configuracoes", label:"Configurações", icon:I.mail }] : []).map((item) => {
     const active = path.startsWith(item.to);
     return '<a href="#'+item.to+'" class="inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors '+
       (active ? "bg-secondary text-secondary-foreground" : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground")+'">'+
@@ -780,9 +801,11 @@ async function moveStatus(id, status){
     const type = state.types.find((t) => t.id === r.request_type_id);
     if(type && type.fiscal_assignee_id) patch.assignee_id = type.fiscal_assignee_id;
   }
+  const statusMudou = r && r.status !== status;
   const { error } = await sb.from("requests").update(patch).eq("id", id);
   if(error){ err("Você não tem permissão para alterar esta solicitação."); return; }
   await refreshRequests(); ok("Status atualizado."); render();
+  if(statusMudou && ["concluida","cancelada","cadastro_fiscal"].includes(status)) callEmailService("status_mudou", { id, novoStatus: status });
 }
 
 /* ============================ Acompanhamento (minhas solicitações) ============================ */
@@ -962,6 +985,13 @@ async function criarSolicitacao(e){
   }
 
   await refreshRequests();
+  callEmailService("solicitacao_criada", {
+    id: data.id, code: (state.requests.find((r) => r.id === data.id) || {}).code,
+    title: n.title.trim(), target_department_id: n.target, priority: n.priority, due_date: n.due || null,
+    assignee_id: n.assignee || null, request_type_id: n.typeId || null,
+    requester_nome: state.profile ? (state.profile.full_name || state.profile.email) : "",
+    requester_email: state.profile ? state.profile.email : "",
+  });
   state.novo = { typeId:"", target:"", title:"", priority:"media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee:"", formData:{}, files:{} };
   ok("Solicitação criada.");
   go("/solicitacao/"+data.id);
@@ -1248,8 +1278,9 @@ function viewDetalhe(id){
     '</aside></div></div>';
 }
 async function atualizarSolicitacao(id, patch){
+  const antes = state.requests.find((x) => x.id === id);
   if(patch.status === "cadastro_fiscal"){
-    const r = state.requests.find((x) => x.id === id);
+    const r = antes;
     if(r && !typeAllowsFiscal(r)){ err('Este tipo de solicitação não usa a etapa "Cadastro fiscal".'); return; }
     const type = r && state.types.find((t) => t.id === r.request_type_id);
     if(type && type.fiscal_assignee_id) patch.assignee_id = type.fiscal_assignee_id;
@@ -1259,6 +1290,12 @@ async function atualizarSolicitacao(id, patch){
   await refreshRequests();
   ok("Solicitação atualizada.");
   await loadDetalhe(id);
+  if(patch.status && antes && antes.status !== patch.status && ["concluida","cancelada","cadastro_fiscal"].includes(patch.status)){
+    callEmailService("status_mudou", { id, novoStatus: patch.status });
+  }
+  if("assignee_id" in patch && patch.assignee_id && antes && antes.assignee_id !== patch.assignee_id){
+    callEmailService("responsavel_trocado", { id, novoResponsavelId: patch.assignee_id });
+  }
 }
 async function comentar(id){
   const el = document.getElementById("novo-comentario");
@@ -1267,6 +1304,7 @@ async function comentar(id){
   const { error } = await sb.from("request_comments").insert({ request_id: id, author_id: state.user.id, body });
   if(error){ err("Não foi possível enviar o comentário."); return; }
   await loadDetalhe(id);
+  callEmailService("comentario_novo", { id, autorId: state.user.id, texto: body });
 }
 
 /* ============================ Tipos de solicitação ============================ */
@@ -1390,6 +1428,109 @@ async function toggleTipo(id, value){
   await refreshTypes(); render();
 }
 
+/* ============================ Configurações (e-mails) ============================ */
+const EMAIL_RULES = [
+  { key:"criada", label:"Solicitação criada" },
+  { key:"status_mudou", label:"Mudanças de status" },
+  { key:"responsavel_trocado", label:"Responsável trocado" },
+  { key:"comentario_novo", label:"Comentário novo" },
+  { key:"convite_acesso", label:"Convite de acesso" },
+  { key:"aguardando_diario", label:"Aguardando informações (diário, 8h)" },
+  { key:"atraso_diario", label:"Lembrete de atraso (diário, 8h)" },
+];
+function viewConfiguracoes(){
+  const gasUrl = state.settings.email_gas_url || "";
+  const secret = state.settings.email_shared_secret || "";
+  const configurado = !!(gasUrl && secret);
+  const statusRows = EMAIL_RULES.map((rule) => {
+    const st = state.emailStatus && state.emailStatus[rule.key];
+    const quando = st && st.lastRunAt ? formatDate(st.lastRunAt) + " " + new Date(st.lastRunAt).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "Nunca rodou";
+    const okBadge = !st ? '<span class="rounded-full bg-secondary px-2 py-0.5 text-[11px] text-secondary-foreground">Sem dados</span>'
+      : st.ok ? '<span class="rounded-full px-2 py-0.5 text-[11px] font-medium" style="background:rgba(99,153,34,.15);color:var(--status-concluida)">OK</span>'
+      : '<span class="rounded-full bg-destructive/15 px-2 py-0.5 text-[11px] font-medium text-destructive">Erro</span>';
+    return '<tr class="border-b border-border/60 last:border-0">'+
+      '<td class="py-2 pr-3 font-medium">'+rule.label+'</td>'+
+      '<td class="py-2 pr-3 text-muted-foreground">'+quando+'</td>'+
+      '<td class="py-2 pr-3">'+okBadge+(st && st.sentCount != null ? '<span class="ml-2 text-xs text-muted-foreground">'+st.sentCount+' enviado(s)</span>' : "")+'</td>'+
+      '<td class="py-2 text-destructive text-xs">'+(st && st.lastError ? esc(st.lastError) : "")+'</td>'+
+    '</tr>';
+  }).join("");
+
+  return '<div class="mx-auto max-w-4xl"><h1 class="text-3xl font-bold">Configurações</h1>'+
+    '<p class="mt-1 text-sm text-muted-foreground">Conexão com o serviço de e-mails (Google Apps Script), testes manuais e status dos envios.</p>'+
+
+    '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<h2 class="text-sm font-semibold">Conexão com o Google Apps Script</h2>'+
+      '<p class="mt-1 text-xs text-muted-foreground">Cole aqui a URL do Web App publicado e a senha (shared secret) configurada nas Propriedades do script.</p>'+
+      '<div class="mt-4 grid gap-3 sm:grid-cols-2">'+
+        '<div><label class="lbl">URL do Web App</label><input class="inp" id="cfgGasUrl" placeholder="https://script.google.com/macros/s/.../exec" value="'+esc(gasUrl)+'" /></div>'+
+        '<div><label class="lbl">Senha (shared secret)</label><input class="inp" id="cfgSecret" placeholder="a mesma senha do Apps Script" value="'+esc(secret)+'" /></div>'+
+      '</div>'+
+      '<div class="mt-4 flex items-center gap-3">'+
+        '<button type="button" class="btn btn-primary" onclick="salvarConexaoEmail()">Salvar conexão</button>'+
+        '<button type="button" class="btn btn-outline" onclick="testarConexaoEmail()">Testar conexão</button>'+
+        (configurado ? '<span class="text-xs" style="color:var(--status-concluida)">Conectado</span>' : '<span class="text-xs text-muted-foreground">Ainda não configurado</span>')+
+      '</div>'+
+    '</section>'+
+
+    '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<h2 class="text-sm font-semibold">Testar agora</h2>'+
+      '<p class="mt-1 text-xs text-muted-foreground">Roda cada regra manualmente, sem esperar o horário automático (8h).</p>'+
+      '<div class="mt-4 flex flex-wrap gap-2">'+
+        '<button type="button" class="btn btn-outline btn-sm" onclick="testarRegraEmail(\'run_aguardando\')">Rodar "Aguardando informações" agora</button>'+
+        '<button type="button" class="btn btn-outline btn-sm" onclick="testarRegraEmail(\'run_atraso\')">Rodar "Lembrete de atraso" agora</button>'+
+      '</div>'+
+      '<div class="mt-4 flex flex-wrap items-end gap-2">'+
+        '<div class="flex-1 min-w-[14rem]"><label class="lbl">Testar convite de acesso (e-mail avulso)</label><input class="inp" id="cfgTestEmail" placeholder="alguem@empresa.com" /></div>'+
+        '<button type="button" class="btn btn-outline btn-sm" onclick="testarConviteEmail()">Enviar teste</button>'+
+      '</div>'+
+    '</section>'+
+
+    '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<div class="flex items-center justify-between"><h2 class="text-sm font-semibold">Status dos envios</h2>'+
+        '<button type="button" class="btn btn-ghost btn-sm" onclick="refreshEmailStatus().then(render)">Atualizar</button></div>'+
+      '<div class="mt-4 overflow-x-auto"><table class="w-full text-sm">'+
+        '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground">'+
+          '<th class="pb-2 font-medium">Regra</th><th class="pb-2 font-medium">Última vez que rodou</th><th class="pb-2 font-medium">Resultado</th><th class="pb-2 font-medium">Erro</th>'+
+        '</tr></thead><tbody>'+statusRows+'</tbody></table></div>'+
+    '</section>'+
+  '</div>';
+}
+async function salvarConexaoEmail(){
+  const url = document.getElementById("cfgGasUrl").value.trim();
+  const secret = document.getElementById("cfgSecret").value.trim();
+  if(!url || !secret) return err("Preencha a URL e a senha antes de salvar.");
+  const { error: e1 } = await sb.from("app_settings").upsert({ key:"email_gas_url", value:url });
+  const { error: e2 } = await sb.from("app_settings").upsert({ key:"email_shared_secret", value:secret });
+  if(e1 || e2){ err("Não foi possível salvar."); return; }
+  await refreshSettings(); ok("Conexão salva."); render();
+}
+async function testarConexaoEmail(){
+  ok("Testando conexão...");
+  const res = await callEmailService("ping", {});
+  if(res.ok) ok("Conectado! O Apps Script respondeu normalmente.");
+  else err("Falha na conexão: "+(res.error === "not_configured" ? "salve a URL e a senha primeiro." : res.error));
+}
+async function testarRegraEmail(action){
+  ok("Rodando...");
+  const res = await callEmailService(action, {});
+  if(res.ok) ok("Rodou com sucesso. "+(res.sentCount != null ? res.sentCount+" e-mail(s) enviado(s)." : ""));
+  else err("Erro ao rodar: "+res.error);
+  await refreshEmailStatus(); render();
+}
+async function testarConviteEmail(){
+  const email = document.getElementById("cfgTestEmail").value.trim();
+  if(!email) return err("Informe um e-mail para o teste.");
+  ok("Enviando teste...");
+  const res = await callEmailService("convite_acesso", { nome:"Teste", email });
+  if(res.ok) ok("E-mail de teste enviado para "+email+".");
+  else err("Erro ao enviar: "+res.error);
+}
+async function refreshEmailStatus(){
+  const { data } = await sb.from("email_status").select("*");
+  state.emailStatus = Object.fromEntries((data || []).map((s) => [s.id, s]));
+}
+
 /* ============================ Cadastro de pessoas (admin) ============================ */
 function viewPessoas(){
   const p = state.pessoa;
@@ -1477,6 +1618,7 @@ async function salvarPessoa(e){
   const p = state.pessoa;
   if(p.name.trim().length < 2) return err("Informe o nome completo."), false;
   if(!/^\S+@\S+\.\S+$/.test(p.email.trim())) return err("E-mail inválido."), false;
+  const isNew = !p.editingId;
   const payload = { full_name: p.name.trim(), email: p.email.trim().toLowerCase(), active: p.active };
   const { error } = p.editingId
     ? await sb.from("pessoas_cadastradas").update(payload).eq("id", p.editingId)
@@ -1484,6 +1626,7 @@ async function salvarPessoa(e){
   if(error){ err("Não foi possível salvar: "+error.message); return false; }
   state.pessoa = { editingId: null, name: "", email: "", active: true };
   await refreshPessoas(); ok(p.editingId ? "Pessoa atualizada." : "Pessoa cadastrada."); render();
+  if(isNew && payload.active) callEmailService("convite_acesso", { nome: payload.full_name, email: payload.email });
   return false;
 }
 async function togglePessoa(id, active){
