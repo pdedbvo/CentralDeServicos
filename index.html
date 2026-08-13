@@ -415,6 +415,7 @@ const isHardcodedMaster = (email) => MASTER_EMAILS.includes(String(email||"").tr
 const state = {
   user: null, profile: null, isMaster: false,
   departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {},
+  requestsArchiveLoaded: false, requestsArchiveLoading: false,
   filters: {
     painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
     relPeriod: "90", relDep: "todos", agendaRange: "todos", acompStatus: "todos",
@@ -429,19 +430,21 @@ const state = {
   ready: false,
 };
 
+const ACTIVE_STATUSES = ["aberta","em_andamento","cadastro_fiscal","aguardando"];
 async function loadCore(){
-  const [deps, profs, types, reqs, pessoas, settings] = await Promise.all([
+  const [deps, profs, types, activeReqs, pessoas, settings] = await Promise.all([
     sb.from("departments").select("*").order("name"),
     sb.from("profiles").select("*").order("full_name"),
     sb.from("request_types").select("*").order("name"),
-    sb.from("requests").select("*").order("created_at", { ascending:false }),
+    Promise.all(ACTIVE_STATUSES.map((s) => sb.from("requests").select("*").eq("status", s))),
     sb.from("pessoas_cadastradas").select("*").order("full_name"),
     sb.from("app_settings").select("*"),
   ]);
   state.departments = deps.data || [];
   state.profiles = profs.data || [];
   state.types = types.data || [];
-  state.requests = reqs.data || [];
+  state.requests = activeReqs.flatMap((r) => r.data || []).sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
+  state.requestsArchiveLoaded = false; state.requestsArchiveLoading = false;
   state.pessoas = pessoas.data || [];
   state.settings = Object.fromEntries((settings.data || []).map((s) => [s.key, s.value]));
   state.profile = state.profiles.find((p) => p.id === state.user?.id) || null;
@@ -455,6 +458,50 @@ async function loadCore(){
     await refreshRoles();
     if(state.isMaster) await refreshEmailStatus();
   }
+}
+// Carrega o histórico (concluídas/canceladas) só quando alguma tela que
+// precisa dele é aberta (Quadro, Acompanhamento, Relatórios, Agenda) — em
+// vez de sempre, isso evita reler ~1.900 documentos a cada login/ação.
+const ARCHIVE_CACHE_KEY = "dbvohub_archive_cache_v1";
+const ARCHIVE_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 horas
+function readArchiveCache_(){
+  try{
+    const raw = localStorage.getItem(ARCHIVE_CACHE_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(!parsed.at || Date.now() - parsed.at > ARCHIVE_CACHE_MAX_AGE_MS) return null;
+    return parsed.data;
+  } catch(_){ return null; }
+}
+function writeArchiveCache_(data){
+  try{ localStorage.setItem(ARCHIVE_CACHE_KEY, JSON.stringify({ at: Date.now(), data })); } catch(_){ /* localStorage indisponível ou cheio: só deixa de cachear */ }
+}
+async function ensureArchiveLoaded(){
+  if(state.requestsArchiveLoaded || state.requestsArchiveLoading) return;
+  state.requestsArchiveLoading = true;
+  let arquivo = readArchiveCache_();
+  if(!arquivo){
+    const [concluidas, canceladas] = await Promise.all([
+      sb.from("requests").select("*").eq("status","concluida"),
+      sb.from("requests").select("*").eq("status","cancelada"),
+    ]);
+    arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    writeArchiveCache_(arquivo);
+  }
+  const existentes = new Set(state.requests.map((r) => r.id));
+  arquivo.forEach((r) => { if(!existentes.has(r.id)){ state.requests.push(r); existentes.add(r.id); } });
+  state.requestsArchiveLoaded = true;
+  state.requestsArchiveLoading = false;
+}
+// Se uma solicitação vira concluída/cancelada, atualiza o cache também (senão
+// o cache antigo "esconderia" essa mudança de quem está vendo o cache).
+function invalidateArchiveCacheEntry_(request){
+  if(!request || (request.status !== "concluida" && request.status !== "cancelada")) return;
+  const cached = readArchiveCache_();
+  if(!cached) return;
+  const idx = cached.findIndex((r) => r.id === request.id);
+  if(idx >= 0) cached[idx] = request; else cached.push(request);
+  writeArchiveCache_(cached);
 }
 async function refreshRoles(){
   if(!state.isMaster){ state.allRoles = []; return; }
@@ -544,6 +591,10 @@ async function render(){
   if(path.startsWith("/auth")){ app.innerHTML = viewAuth(); return; }
 
   let inner = "";
+  const NEEDS_ARCHIVE = ["/painel","/acompanhamento","/relatorios","/agenda"];
+  if(NEEDS_ARCHIVE.some((p) => path.startsWith(p)) && !state.requestsArchiveLoaded){
+    ensureArchiveLoaded().then(render);
+  }
   if(path.startsWith("/painel")) inner = viewPainel();
   else if(path.startsWith("/nova")) inner = viewNova();
   else if(path.startsWith("/agenda")) inner = viewAgenda();
@@ -790,7 +841,10 @@ async function excluirSolicitacao(id){
   if(!confirm("Excluir esta solicitação definitivamente? Essa ação não pode ser desfeita.")) return;
   const { error } = await sb.from("requests").delete().eq("id", id);
   if(error){ err("Somente o usuário master pode excluir solicitações."); return; }
-  await refreshRequests(); ok("Solicitação excluída.");
+  state.requests = state.requests.filter((r) => r.id !== id);
+  const cached = readArchiveCache_();
+  if(cached){ writeArchiveCache_(cached.filter((r) => r.id !== id)); }
+  ok("Solicitação excluída.");
   if(route().startsWith("/solicitacao/")) go("/painel"); else render();
 }
 async function moveStatus(id, status){
@@ -804,7 +858,9 @@ async function moveStatus(id, status){
   const statusMudou = r && r.status !== status;
   const { error } = await sb.from("requests").update(patch).eq("id", id);
   if(error){ err("Você não tem permissão para alterar esta solicitação."); return; }
-  await refreshRequests(); ok("Status atualizado."); render();
+  if(r) Object.assign(r, patch);
+  invalidateArchiveCacheEntry_(r);
+  ok("Status atualizado."); render();
   if(statusMudou && ["concluida","cancelada","cadastro_fiscal"].includes(status)) callEmailService("status_mudou", { id, novoStatus: status });
 }
 
@@ -982,11 +1038,12 @@ async function criarSolicitacao(e){
       }
     }
     await sb.from("requests").update({ form_data: mergedFormData }).eq("id", data.id);
+    data.form_data = mergedFormData;
   }
 
-  await refreshRequests();
+  state.requests.unshift(data);
   callEmailService("solicitacao_criada", {
-    id: data.id, code: (state.requests.find((r) => r.id === data.id) || {}).code,
+    id: data.id, code: data.code,
     title: n.title.trim(), target_department_id: n.target, priority: n.priority, due_date: n.due || null,
     assignee_id: n.assignee || null, request_type_id: n.typeId || null,
     requester_nome: state.profile ? (state.profile.full_name || state.profile.email) : "",
@@ -1287,7 +1344,8 @@ async function atualizarSolicitacao(id, patch){
   }
   const { error } = await sb.from("requests").update(patch).eq("id", id);
   if(error){ err("Você não tem permissão para alterar esta solicitação."); return; }
-  await refreshRequests();
+  if(antes) Object.assign(antes, patch);
+  invalidateArchiveCacheEntry_(antes);
   ok("Solicitação atualizada.");
   await loadDetalhe(id);
   if(patch.status && antes && antes.status !== patch.status && ["concluida","cancelada","cadastro_fiscal"].includes(patch.status)){
