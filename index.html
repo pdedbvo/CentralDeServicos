@@ -149,6 +149,7 @@ function makeQuery(table){
   const builder = {
     select(){ q._selectAfterWrite = true; return builder; },
     eq(field, val){ q.filters.push([field, val]); return builder; },
+    gte(field, val){ q.rangeFilters = q.rangeFilters || []; q.rangeFilters.push([field, val]); return builder; },
     order(field, opts){ q.orders.push([field, opts||{}]); return builder; },
     single(){ q._single = true; return builder; },
     maybeSingle(){ q._maybeSingle = true; return builder; },
@@ -226,6 +227,7 @@ async function execute(table, q){
     }
     let ref = fbDb.collection(table);
     q.filters.forEach(([field, val]) => { ref = ref.where(field, "==", val); });
+    (q.rangeFilters || []).forEach(([field, val]) => { ref = ref.where(field, ">=", val); });
     q.orders.forEach(([field, opts]) => { ref = ref.orderBy(field, opts.ascending === false ? "desc" : "asc"); });
     const snap = await ref.get();
     const rows = snap.docs.map((d) => Object.assign({ id: d.id }, d.data()));
@@ -416,6 +418,7 @@ const state = {
   user: null, profile: null, isMaster: false,
   departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {},
   requestsArchiveLoaded: false, requestsArchiveLoading: false,
+  requestsFullArchiveLoaded: false, requestsFullArchiveLoading: false,
   filters: {
     painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
     relPeriod: "90", relDep: "todos", agendaRange: "todos", acompStatus: "todos",
@@ -445,6 +448,7 @@ async function loadCore(){
   state.types = types.data || [];
   state.requests = activeReqs.flatMap((r) => r.data || []).sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
   state.requestsArchiveLoaded = false; state.requestsArchiveLoading = false;
+  state.requestsFullArchiveLoaded = false; state.requestsFullArchiveLoading = false;
   state.pessoas = pessoas.data || [];
   state.settings = Object.fromEntries((settings.data || []).map((s) => [s.key, s.value]));
   state.profile = state.profiles.find((p) => p.id === state.user?.id) || null;
@@ -462,46 +466,80 @@ async function loadCore(){
 // Carrega o histórico (concluídas/canceladas) só quando alguma tela que
 // precisa dele é aberta (Quadro, Acompanhamento, Relatórios, Agenda) — em
 // vez de sempre, isso evita reler ~1.900 documentos a cada login/ação.
-const ARCHIVE_CACHE_KEY = "dbvohub_archive_cache_v1";
+//
+// Duas camadas:
+//  - "recente": concluídas/canceladas dos últimos ARCHIVE_RECENT_DAYS dias.
+//    Carrega sempre que uma tela comum é aberta (cobre os filtros padrão de
+//    90 dias do Quadro e dos Relatórios).
+//  - "completo": TODO o histórico. Só é buscado quando alguém realmente pede
+//    um período maior (ex: "Todo o período" nos Relatórios ou no Quadro).
+const ARCHIVE_RECENT_DAYS = 120;
+const ARCHIVE_CACHE_KEY = "dbvohub_archive_recent_cache_v2";
+const ARCHIVE_FULL_CACHE_KEY = "dbvohub_archive_full_cache_v2";
 const ARCHIVE_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 horas
-function readArchiveCache_(){
+function readCache_(key){
   try{
-    const raw = localStorage.getItem(ARCHIVE_CACHE_KEY);
+    const raw = localStorage.getItem(key);
     if(!raw) return null;
     const parsed = JSON.parse(raw);
     if(!parsed.at || Date.now() - parsed.at > ARCHIVE_CACHE_MAX_AGE_MS) return null;
     return parsed.data;
   } catch(_){ return null; }
 }
-function writeArchiveCache_(data){
-  try{ localStorage.setItem(ARCHIVE_CACHE_KEY, JSON.stringify({ at: Date.now(), data })); } catch(_){ /* localStorage indisponível ou cheio: só deixa de cachear */ }
+function writeCache_(key, data){
+  try{ localStorage.setItem(key, JSON.stringify({ at: Date.now(), data })); } catch(_){ /* localStorage indisponível ou cheio: só deixa de cachear */ }
+}
+function mergeIntoRequests_(lista){
+  const existentes = new Set(state.requests.map((r) => r.id));
+  lista.forEach((r) => { if(!existentes.has(r.id)){ state.requests.push(r); existentes.add(r.id); } });
 }
 async function ensureArchiveLoaded(){
   if(state.requestsArchiveLoaded || state.requestsArchiveLoading) return;
   state.requestsArchiveLoading = true;
-  let arquivo = readArchiveCache_();
+  let arquivo = readCache_(ARCHIVE_CACHE_KEY);
+  if(!arquivo){
+    const cutoff = new Date(Date.now() - ARCHIVE_RECENT_DAYS*86400000).toISOString();
+    const [concluidas, canceladas] = await Promise.all([
+      sb.from("requests").select("*").eq("status","concluida").gte("completed_at", cutoff),
+      sb.from("requests").select("*").eq("status","cancelada").gte("completed_at", cutoff),
+    ]);
+    arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    writeCache_(ARCHIVE_CACHE_KEY, arquivo);
+  }
+  mergeIntoRequests_(arquivo);
+  state.requestsArchiveLoaded = true;
+  state.requestsArchiveLoading = false;
+}
+// Histórico completo (sem limite de data) — só quando alguém pede
+// explicitamente um período maior que os últimos ARCHIVE_RECENT_DAYS dias.
+async function ensureFullArchiveLoaded(){
+  if(state.requestsFullArchiveLoaded || state.requestsFullArchiveLoading) return;
+  await ensureArchiveLoaded(); // garante que a camada recente já está mesclada
+  state.requestsFullArchiveLoading = true;
+  let arquivo = readCache_(ARCHIVE_FULL_CACHE_KEY);
   if(!arquivo){
     const [concluidas, canceladas] = await Promise.all([
       sb.from("requests").select("*").eq("status","concluida"),
       sb.from("requests").select("*").eq("status","cancelada"),
     ]);
     arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
-    writeArchiveCache_(arquivo);
+    writeCache_(ARCHIVE_FULL_CACHE_KEY, arquivo);
   }
-  const existentes = new Set(state.requests.map((r) => r.id));
-  arquivo.forEach((r) => { if(!existentes.has(r.id)){ state.requests.push(r); existentes.add(r.id); } });
-  state.requestsArchiveLoaded = true;
-  state.requestsArchiveLoading = false;
+  mergeIntoRequests_(arquivo);
+  state.requestsFullArchiveLoaded = true;
+  state.requestsFullArchiveLoading = false;
 }
-// Se uma solicitação vira concluída/cancelada, atualiza o cache também (senão
-// o cache antigo "esconderia" essa mudança de quem está vendo o cache).
+// Se uma solicitação vira concluída/cancelada, atualiza os caches também
+// (senão um cache antigo "esconderia" essa mudança de quem está vendo ele).
 function invalidateArchiveCacheEntry_(request){
   if(!request || (request.status !== "concluida" && request.status !== "cancelada")) return;
-  const cached = readArchiveCache_();
-  if(!cached) return;
-  const idx = cached.findIndex((r) => r.id === request.id);
-  if(idx >= 0) cached[idx] = request; else cached.push(request);
-  writeArchiveCache_(cached);
+  [ARCHIVE_CACHE_KEY, ARCHIVE_FULL_CACHE_KEY].forEach((key) => {
+    const cached = readCache_(key);
+    if(!cached) return;
+    const idx = cached.findIndex((r) => r.id === request.id);
+    if(idx >= 0) cached[idx] = request; else cached.push(request);
+    writeCache_(key, cached);
+  });
 }
 async function refreshRoles(){
   if(!state.isMaster){ state.allRoles = []; return; }
@@ -544,10 +582,6 @@ async function callEmailService(action, payload){
   } catch(e){
     return { ok:false, error: e.message || String(e) };
   }
-}
-async function refreshRequests(){
-  const { data } = await sb.from("requests").select("*").order("created_at", { ascending:false });
-  state.requests = data || [];
 }
 async function refreshTasks(){
   if(!state.user) return;
@@ -594,6 +628,15 @@ async function render(){
   const NEEDS_ARCHIVE = ["/painel","/acompanhamento","/relatorios","/agenda"];
   if(NEEDS_ARCHIVE.some((p) => path.startsWith(p)) && !state.requestsArchiveLoaded){
     ensureArchiveLoaded().then(render);
+  }
+  // Períodos maiores que a janela "recente" (120 dias) precisam do histórico completo.
+  const periodoAmplo = (v) => v === "todos" || Number(v) > ARCHIVE_RECENT_DAYS;
+  if(!state.requestsFullArchiveLoaded && (
+    (path.startsWith("/painel") && periodoAmplo(state.filters.painelPeriod)) ||
+    (path.startsWith("/relatorios") && periodoAmplo(state.filters.relPeriod)) ||
+    path.startsWith("/acompanhamento")
+  )){
+    ensureFullArchiveLoaded().then(render);
   }
   if(path.startsWith("/painel")) inner = viewPainel();
   else if(path.startsWith("/nova")) inner = viewNova();
@@ -808,6 +851,8 @@ function viewPainel(){
     '<a href="#/nova" class="btn btn-primary">'+I.plus+' Nova</a>'+
     '</div>'+
     filterBar+
+    (["todos","365"].includes(state.filters.painelPeriod) ? '<p class="mt-3 rounded-lg border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">'+
+      'Use "Todo o período" e "Últimos 12 meses" com moderação: eles carregam o histórico completo, o que pesa mais no banco de dados.</p>' : "")+
     '<div class="mt-6 grid gap-4 lg:grid-cols-6">'+columns+'</div></div>';
 }
 function requestCard(r){
@@ -842,15 +887,17 @@ async function excluirSolicitacao(id){
   const { error } = await sb.from("requests").delete().eq("id", id);
   if(error){ err("Somente o usuário master pode excluir solicitações."); return; }
   state.requests = state.requests.filter((r) => r.id !== id);
-  const cached = readArchiveCache_();
-  if(cached){ writeArchiveCache_(cached.filter((r) => r.id !== id)); }
+  [ARCHIVE_CACHE_KEY, ARCHIVE_FULL_CACHE_KEY].forEach((key) => {
+    const cached = readCache_(key);
+    if(cached) writeCache_(key, cached.filter((r) => r.id !== id));
+  });
   ok("Solicitação excluída.");
   if(route().startsWith("/solicitacao/")) go("/painel"); else render();
 }
 async function moveStatus(id, status){
   const r = state.requests.find((x) => x.id === id);
   if(status === "cadastro_fiscal" && r && !typeAllowsFiscal(r)){ err('Este tipo de solicitação não usa a etapa "Cadastro fiscal".'); return; }
-  const patch = { status, completed_at: status === "concluida" ? new Date().toISOString() : null };
+  const patch = { status, completed_at: (status === "concluida" || status === "cancelada") ? new Date().toISOString() : null };
   if(status === "cadastro_fiscal" && r){
     const type = state.types.find((t) => t.id === r.request_type_id);
     if(type && type.fiscal_assignee_id) patch.assignee_id = type.fiscal_assignee_id;
@@ -1325,7 +1372,7 @@ function viewDetalhe(id){
       field("Tipo", type ? (type.name + (type.tag ? " · "+type.tag : "")) : "Livre")+
       field("Aberta em", formatDate(r.created_at))+
       '<div class="space-y-2 border-t border-border pt-4"><label class="lbl">Status</label>'+
-        '<select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{status:this.value,completed_at:this.value===\'concluida\'?new Date().toISOString():null})">'+statusOpts+'</select></div>'+
+        '<select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{status:this.value,completed_at:(this.value===\'concluida\'||this.value===\'cancelada\')?new Date().toISOString():null})">'+statusOpts+'</select></div>'+
       '<div><label class="lbl">Prioridade</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{priority:this.value})">'+prioOpts+'</select></div>'+
       '<div><label class="lbl">Responsável</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{assignee_id:this.value||null})">'+userOpts+'</select></div>'+
       '<div><label class="lbl">Prazo de finalização</label>'+
@@ -1847,6 +1894,9 @@ function viewRelatorios(){
       '<select class="inp w-56" onchange="state.filters.relDep=this.value;render()">'+depOpts+'</select>'+
       '<button class="btn btn-outline" onclick="exportCsv()">'+I.download+' Exportar CSV</button>'+
     '</div></div>'+
+    (["todos","365"].includes(state.filters.relPeriod) ? '<p class="mt-3 rounded-lg border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">'+
+      'Use "Todo o período" e "Últimos 12 meses" com moderação: eles carregam o histórico completo do banco, o que pesa mais e, '+
+      'se usado com muita frequência ao longo do dia, pode deixar o app fora do ar até o dia seguinte (limite gratuito do banco de dados).</p>' : "")+
     '<div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">'+
       kpi("Solicitações", rows.length, "no período")+
       kpi("Em aberto", open.length, "fora de concluída/cancelada")+
