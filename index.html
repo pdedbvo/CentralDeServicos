@@ -294,6 +294,8 @@ const STATUS_ORDER = ["aberta","em_andamento","cadastro_fiscal","aguardando","co
 const STATUS_LABEL = { aberta:"Aberta", em_andamento:"Em andamento", cadastro_fiscal:"Cadastro fiscal", aguardando:"Aguardando informações", concluida:"Concluída", cancelada:"Cancelada" };
 const STATUS_DOT = { aberta:"bg-status-aberta", em_andamento:"bg-status-andamento", cadastro_fiscal:"bg-status-fiscal", aguardando:"bg-status-aguardando", concluida:"bg-status-concluida", cancelada:"bg-status-cancelada" };
 const PRIORITY_LABEL = { baixa:"Baixa", media:"Média", alta:"Alta", urgente:"Urgente" };
+// Solicitações antigas (importadas) podem não ter prioridade: assume "média".
+const prioridadeDe = (r) => (r && r.priority && PRIORITY_LABEL[r.priority]) ? r.priority : "media";
 const PRIORITY_CLASS = {
   baixa:"bg-muted text-muted-foreground",
   media:"bg-secondary text-secondary-foreground",
@@ -410,18 +412,42 @@ const err = (m) => toast(m, "error");
 const MASTER_EMAILS = [
   "anaflavia.l@edificabpo.com.br",
   "sergio.f@edificabpo.com.br",
+  "jaquelline.a@edificabpo.com.br",
 ];
-const isHardcodedMaster = (email) => MASTER_EMAILS.includes(String(email||"").trim().toLowerCase());
+/* ============================ Níveis de acesso ============================
+   master               -> vê e faz tudo
+   solicitante          -> abre e acompanha as próprias solicitações
+   solicitado           -> executa: vê no Quadro só o que é responsável
+   solicitante_solicitado -> as duas coisas
+   Quem não tem nível definido entra como "solicitante" (o mais restrito que
+   ainda permite trabalhar). */
+const ACCESS_LEVELS = [
+  { value:"solicitante", label:"Solicitante", desc:"Abre e acompanha as próprias solicitações" },
+  { value:"solicitado", label:"Solicitado", desc:"Executa: vê no quadro só o que é responsável" },
+  { value:"solicitante_solicitado", label:"Solicitante e solicitado", desc:"Abre solicitações e também executa" },
+  { value:"master", label:"Master", desc:"Acesso total: cadastros, tipos, relatórios e configurações" },
+];
+const ACCESS_LEVEL_LABEL = Object.fromEntries(ACCESS_LEVELS.map((l) => [l.value, l.label]));
+function podeSolicitar(){ return ["solicitante","solicitante_solicitado","master"].includes(state.accessLevel); }
+function podeExecutar(){ return ["solicitado","solicitante_solicitado","master"].includes(state.accessLevel); }
+function levelOf(userId){
+  const r = state.allRoles.find((x) => x.user_id === userId && ACCESS_LEVELS.some((l) => l.value === x.role));
+  if(r) return r.role;
+  const p = state.profiles.find((x) => x.id === userId);
+  if(p && isHardcodedMaster(p.email)) return "master";
+  return "solicitante";
+}
+function isHardcodedMaster(email){ return MASTER_EMAILS.includes(String(email||"").trim().toLowerCase()); }
 
 /* ============================ Estado / dados ============================ */
 const state = {
-  user: null, profile: null, isMaster: false,
+  user: null, profile: null, isMaster: false, accessLevel: "solicitante",
   departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {},
   requestsArchiveLoaded: false, requestsArchiveLoading: false,
   requestsFullArchiveLoaded: false, requestsFullArchiveLoading: false,
   filters: {
     painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
-    relPeriod: "90", relDep: "todos", agendaRange: "todos", acompStatus: "todos",
+    relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos",
   },
   agenda: { showForm: false, showDone: false, viewUserId: "" },
   painelExpanded: {},
@@ -435,30 +461,73 @@ const state = {
 
 const ACTIVE_STATUSES = ["aberta","em_andamento","cadastro_fiscal","aguardando"];
 async function loadCore(){
+  // 1) Descobrir o nível ANTES de buscar solicitações, para buscar só o que
+  //    esta pessoa realmente pode ver (menos leituras no banco).
+  if(state.user){
+    const roles = await sb.from("user_roles").select("role").eq("user_id", state.user.id);
+    const meusPapeis = (roles.data || []).map((r) => r.role);
+    const nivelSalvo = meusPapeis.find((r) => ACCESS_LEVELS.some((l) => l.value === r));
+    state.isMaster = meusPapeis.includes("master") || isHardcodedMaster(state.user.email);
+    state.accessLevel = state.isMaster ? "master" : (nivelSalvo || "solicitante");
+  }
+
+  // 2) Solicitações ativas: master vê todas; os demais recebem só as suas
+  //    (as que são responsáveis e as que abriram).
+  const buscarAtivas = () => {
+    if(state.isMaster || !state.user){
+      return Promise.all(ACTIVE_STATUSES.map((s) => sb.from("requests").select("*").eq("status", s)));
+    }
+    return Promise.all([
+      sb.from("requests").select("*").eq("assignee_id", state.user.id),
+      sb.from("requests").select("*").eq("requester_id", state.user.id),
+    ]);
+  };
+
   const [deps, profs, types, activeReqs, pessoas, settings] = await Promise.all([
     sb.from("departments").select("*").order("name"),
     sb.from("profiles").select("*").order("full_name"),
     sb.from("request_types").select("*").order("name"),
-    Promise.all(ACTIVE_STATUSES.map((s) => sb.from("requests").select("*").eq("status", s))),
+    buscarAtivas(),
     sb.from("pessoas_cadastradas").select("*").order("full_name"),
     sb.from("app_settings").select("*"),
   ]);
   state.departments = deps.data || [];
   state.profiles = profs.data || [];
   state.types = types.data || [];
-  state.requests = activeReqs.flatMap((r) => r.data || []).sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
+  state.requests = (function(){
+    const todas = activeReqs.flatMap((r) => r.data || []);
+    const vistos = new Set();
+    return todas
+      // Quando a busca é por pessoa (não-master), vem qualquer status: mantém
+      // só os ativos aqui; o histórico entra depois, sob demanda.
+      .filter((r) => state.isMaster || !state.user ? true : ACTIVE_STATUSES.includes(r.status))
+      .filter((r) => { if(vistos.has(r.id)) return false; vistos.add(r.id); return true; })
+      .sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
+  })();
   state.requestsArchiveLoaded = false; state.requestsArchiveLoading = false;
   state.requestsFullArchiveLoaded = false; state.requestsFullArchiveLoading = false;
   state.pessoas = pessoas.data || [];
   state.settings = Object.fromEntries((settings.data || []).map((s) => [s.key, s.value]));
   state.profile = state.profiles.find((p) => p.id === state.user?.id) || null;
+  // Autorreparo: se a pessoa tem login mas não tem perfil (conta criada antes
+  // do app passar a criar o perfil no cadastro), cria agora — senão ela não
+  // aparece na lista de pessoas nem pode ser escolhida como responsável.
+  if(state.user && !state.profile){
+    const cadastrada = state.pessoas.find((p) => (p.email||"").toLowerCase() === (state.user.email||"").toLowerCase());
+    const novoPerfil = {
+      full_name: (cadastrada && cadastrada.full_name) || state.user.email.split("@")[0],
+      email: state.user.email, department_id: null,
+    };
+    const { error } = await sb.from("profiles").update(novoPerfil).eq("id", state.user.id);
+    if(!error){
+      state.profile = Object.assign({ id: state.user.id }, novoPerfil);
+      state.profiles.push(state.profile);
+      state.profiles.sort((a,b) => (a.full_name||"").localeCompare(b.full_name||""));
+    }
+  }
   if(state.user){
-    const [tasks, roles] = await Promise.all([
-      sb.from("personal_tasks").select("*").eq("user_id", state.user.id).order("task_date").order("task_time", { nullsFirst:true }),
-      sb.from("user_roles").select("role").eq("user_id", state.user.id),
-    ]);
+    const tasks = await sb.from("personal_tasks").select("*").eq("user_id", state.user.id).order("task_date").order("task_time", { nullsFirst:true });
     state.tasks = tasks.data || [];
-    state.isMaster = (roles.data || []).some((r) => r.role === "master") || isHardcodedMaster(state.user.email);
     await refreshRoles();
     if(state.isMaster) await refreshEmailStatus();
   }
@@ -499,11 +568,24 @@ async function ensureArchiveLoaded(){
   let arquivo = readCache_(ARCHIVE_CACHE_KEY);
   if(!arquivo){
     const cutoff = new Date(Date.now() - ARCHIVE_RECENT_DAYS*86400000).toISOString();
-    const [concluidas, canceladas] = await Promise.all([
-      sb.from("requests").select("*").eq("status","concluida").gte("completed_at", cutoff),
-      sb.from("requests").select("*").eq("status","cancelada").gte("completed_at", cutoff),
-    ]);
-    arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    if(state.isMaster){
+      const [concluidas, canceladas] = await Promise.all([
+        sb.from("requests").select("*").eq("status","concluida").gte("completed_at", cutoff),
+        sb.from("requests").select("*").eq("status","cancelada").gte("completed_at", cutoff),
+      ]);
+      arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    } else {
+      // Quem não é master só precisa do próprio histórico: busca por pessoa
+      // (bem menos leituras) e filtra os arquivados aqui.
+      const [comoResp, comoSolic] = await Promise.all([
+        sb.from("requests").select("*").eq("assignee_id", state.user.id),
+        sb.from("requests").select("*").eq("requester_id", state.user.id),
+      ]);
+      const vistos = new Set();
+      arquivo = [...(comoResp.data||[]), ...(comoSolic.data||[])]
+        .filter((r) => (r.status === "concluida" || r.status === "cancelada") && String(r.completed_at||"") >= cutoff)
+        .filter((r) => { if(vistos.has(r.id)) return false; vistos.add(r.id); return true; });
+    }
     writeCache_(ARCHIVE_CACHE_KEY, arquivo);
   }
   mergeIntoRequests_(arquivo);
@@ -518,11 +600,22 @@ async function ensureFullArchiveLoaded(){
   state.requestsFullArchiveLoading = true;
   let arquivo = readCache_(ARCHIVE_FULL_CACHE_KEY);
   if(!arquivo){
-    const [concluidas, canceladas] = await Promise.all([
-      sb.from("requests").select("*").eq("status","concluida"),
-      sb.from("requests").select("*").eq("status","cancelada"),
-    ]);
-    arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    if(state.isMaster){
+      const [concluidas, canceladas] = await Promise.all([
+        sb.from("requests").select("*").eq("status","concluida"),
+        sb.from("requests").select("*").eq("status","cancelada"),
+      ]);
+      arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+    } else {
+      const [comoResp, comoSolic] = await Promise.all([
+        sb.from("requests").select("*").eq("assignee_id", state.user.id),
+        sb.from("requests").select("*").eq("requester_id", state.user.id),
+      ]);
+      const vistos = new Set();
+      arquivo = [...(comoResp.data||[]), ...(comoSolic.data||[])]
+        .filter((r) => r.status === "concluida" || r.status === "cancelada")
+        .filter((r) => { if(vistos.has(r.id)) return false; vistos.add(r.id); return true; });
+    }
     writeCache_(ARCHIVE_FULL_CACHE_KEY, arquivo);
   }
   mergeIntoRequests_(arquivo);
@@ -545,13 +638,6 @@ async function refreshRoles(){
   if(!state.isMaster){ state.allRoles = []; return; }
   const { data } = await sb.from("user_roles").select("user_id, role");
   state.allRoles = data || [];
-}
-function hasRole(userId, role){
-  if(role === "master"){
-    const p = state.profiles.find((x) => x.id === userId);
-    if(p && isHardcodedMaster(p.email)) return true;
-  }
-  return state.allRoles.some((r) => r.user_id === userId && r.role === role);
 }
 async function refreshDepartments(){
   const { data } = await sb.from("departments").select("*").order("name");
@@ -624,6 +710,13 @@ async function render(){
   if(path === "/" || path === ""){ app.innerHTML = viewLanding(); return; }
   if(path.startsWith("/auth")){ app.innerHTML = viewAuth(); return; }
 
+  // Tela inicial conforme o nível: quem só solicita cai em Acompanhamento,
+  // quem executa cai no Quadro.
+  const telaInicial = () => podeExecutar() ? "/painel" : (podeSolicitar() ? "/acompanhamento" : "/agenda");
+  const semAcesso = (msg) => '<div class="rounded-xl border border-border bg-card p-8 text-center shadow-card">'+
+    '<p class="text-sm text-muted-foreground">'+msg+'</p>'+
+    '<a href="#'+telaInicial()+'" class="btn btn-outline btn-sm mt-4">Ir para minha tela inicial</a></div>';
+
   let inner = "";
   const NEEDS_ARCHIVE = ["/painel","/acompanhamento","/relatorios","/agenda"];
   if(NEEDS_ARCHIVE.some((p) => path.startsWith(p)) && !state.requestsArchiveLoaded){
@@ -638,14 +731,14 @@ async function render(){
   )){
     ensureFullArchiveLoaded().then(render);
   }
-  if(path.startsWith("/painel")) inner = viewPainel();
-  else if(path.startsWith("/nova")) inner = viewNova();
+  if(path.startsWith("/painel")) inner = podeExecutar() ? viewPainel() : semAcesso("Seu acesso não inclui o quadro de execução. Acompanhe suas solicitações na aba Acompanhamento.");
+  else if(path.startsWith("/nova")) inner = podeSolicitar() ? viewNova() : semAcesso("Seu acesso não permite abrir novas solicitações.");
   else if(path.startsWith("/agenda")) inner = viewAgenda();
-  else if(path.startsWith("/acompanhamento")) inner = viewAcompanhamento();
-  else if(path.startsWith("/relatorios")) inner = viewRelatorios();
-  else if(path.startsWith("/tipos")) inner = viewTipos();
-  else if(path.startsWith("/pessoas")) inner = state.isMaster ? viewPessoas() : '<p class="text-sm text-muted-foreground">Somente o acesso master pode acessar a base de dados cadastral.</p>';
-  else if(path.startsWith("/configuracoes")) inner = state.isMaster ? viewConfiguracoes() : '<p class="text-sm text-muted-foreground">Somente o acesso master pode acessar as configurações.</p>';
+  else if(path.startsWith("/acompanhamento")) inner = podeSolicitar() ? viewAcompanhamento() : semAcesso("Seu acesso não inclui o acompanhamento de solicitações abertas por você.");
+  else if(path.startsWith("/relatorios")) inner = state.isMaster ? viewRelatorios() : semAcesso("Os relatórios são restritos ao acesso master.");
+  else if(path.startsWith("/tipos")) inner = state.isMaster ? viewTipos() : semAcesso("Os tipos de solicitação são restritos ao acesso master.");
+  else if(path.startsWith("/pessoas")) inner = state.isMaster ? viewPessoas() : semAcesso("Somente o acesso master pode acessar a base de dados cadastral.");
+  else if(path.startsWith("/configuracoes")) inner = state.isMaster ? viewConfiguracoes() : semAcesso("Somente o acesso master pode acessar as configurações.");
   else if(path.startsWith("/solicitacao/")) inner = viewDetalhe(path.split("/")[2]);
   else inner = '<p class="text-sm text-muted-foreground">Página não encontrada.</p>';
 
@@ -670,16 +763,23 @@ async function render(){
 }
 
 /* ============================ Shell ============================ */
-const NAV = [
-  { to:"/agenda", label:"Minha agenda", icon:I.calendarDays },
-  { to:"/painel", label:"Quadro", icon:I.layout },
-  { to:"/acompanhamento", label:"Acompanhamento", icon:I.clipboardCheck },
-  { to:"/nova", label:"Nova solicitação", icon:I.plus },
-  { to:"/relatorios", label:"Relatórios", icon:I.chart },
-  { to:"/tipos", label:"Tipos de solicitação", icon:I.settings },
-];
+function navParaNivel(){
+  const itens = [{ to:"/agenda", label:"Minha agenda", icon:I.calendarDays }];
+  if(podeExecutar()) itens.push({ to:"/painel", label:"Quadro", icon:I.layout });
+  if(podeSolicitar()){
+    itens.push({ to:"/acompanhamento", label:"Acompanhamento", icon:I.clipboardCheck });
+    itens.push({ to:"/nova", label:"Nova solicitação", icon:I.plus });
+  }
+  if(state.isMaster){
+    itens.push({ to:"/relatorios", label:"Relatórios", icon:I.chart });
+    itens.push({ to:"/tipos", label:"Tipos de solicitação", icon:I.settings });
+    itens.push({ to:"/pessoas", label:"Cadastro de pessoas", icon:I.idCard });
+    itens.push({ to:"/configuracoes", label:"Configurações", icon:I.mail });
+  }
+  return itens;
+}
 function shell(children, path){
-  const nav = NAV.concat(state.isMaster ? [{ to:"/pessoas", label:"Cadastro de pessoas", icon:I.idCard }, { to:"/configuracoes", label:"Configurações", icon:I.mail }] : []).map((item) => {
+  const nav = navParaNivel().map((item) => {
     const active = path.startsWith(item.to);
     return '<a href="#'+item.to+'" class="inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors '+
       (active ? "bg-secondary text-secondary-foreground" : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground")+'">'+
@@ -793,6 +893,8 @@ async function signOut(){ await sb.auth.signOut(); state.user = null; state.task
 function filteredRequests(){
   const f = state.filters;
   let list = state.requests;
+  // Quem não é master vê no quadro apenas as solicitações sob sua responsabilidade.
+  if(!state.isMaster) list = list.filter((r) => r.assignee_id === state.user.id);
   if(f.painelDep !== "todos") list = list.filter((r) => r.target_department_id === f.painelDep || r.requester_department_id === f.painelDep);
   if(f.painelPeriod !== "todos"){
     const limit = Date.now() - Number(f.painelPeriod)*86400000;
@@ -826,7 +928,7 @@ function viewPainel(){
     '<select class="inp w-52" onchange="state.filters.painelDep=this.value;render()">'+depOpts+'</select>'+
     '<select class="inp w-48" onchange="state.filters.painelPeriod=this.value;render()">'+periodOpts+'</select>'+
     '<select class="inp w-48" onchange="state.filters.painelTag=this.value;render()">'+tagOpts+'</select>'+
-    '<select class="inp w-56" onchange="state.filters.painelAssignee=this.value;render()">'+assigneeOpts+'</select>'+
+    (state.isMaster ? '<select class="inp w-56" onchange="state.filters.painelAssignee=this.value;render()">'+assigneeOpts+'</select>' : "")+
   '</div>';
   const CARDS_PER_COLUMN = 40;
   const columns = STATUS_ORDER.map((status) => {
@@ -865,7 +967,7 @@ function requestCard(r){
   return '<article class="rounded-lg border border-border bg-card p-3.5 shadow-card">'+
     '<div class="flex items-start justify-between gap-2">'+
       '<span class="font-mono text-[11px] text-muted-foreground">#'+pad4(r.code)+'</span>'+
-      '<div class="flex items-center gap-1.5">'+tag+'<span class="rounded-full px-2 py-0.5 text-[11px] font-medium '+PRIORITY_CLASS[r.priority]+'">'+PRIORITY_LABEL[r.priority]+'</span></div></div>'+
+      '<div class="flex items-center gap-1.5">'+tag+'<span class="rounded-full px-2 py-0.5 text-[11px] font-medium '+PRIORITY_CLASS[prioridadeDe(r)]+'">'+PRIORITY_LABEL[prioridadeDe(r)]+'</span></div></div>'+
     '<a href="#/solicitacao/'+r.id+'" class="mt-1.5 block font-display text-sm leading-snug font-semibold hover:underline">'+esc(r.title)+'</a>'+
     '<dl class="mt-3 space-y-1 text-[11px] text-muted-foreground">'+
       '<div class="flex gap-1.5"><dt>De</dt><dd class="truncate text-foreground">'+esc(nameById(r.requester_id))+'</dd></div>'+
@@ -881,6 +983,24 @@ function requestCard(r){
       (state.isMaster ? '<button type="button" title="Excluir solicitação" onclick="excluirSolicitacao(\''+r.id+'\')" class="text-muted-foreground hover:text-destructive">'+I.trash+'</button>' : "")+
     '</div>'+
   '</article>';
+}
+// Cancelamento pelo próprio solicitante: ele não mexe no andamento da
+// solicitação, mas pode desistir de um pedido que ele mesmo abriu.
+async function cancelarMinhaSolicitacao(id){
+  const r = state.detalhe.request || state.requests.find((x) => x.id === id);
+  if(!r) return;
+  if(r.requester_id !== state.user.id) return err("Você só pode cancelar solicitações que você abriu.");
+  if(r.status === "concluida" || r.status === "cancelada") return err("Esta solicitação já foi finalizada.");
+  if(!confirm("Cancelar a solicitação #"+pad4(r.code)+"?\n\nO responsável será avisado por e-mail. Essa ação não pode ser desfeita por você.")) return;
+  const patch = { status:"cancelada", completed_at: new Date().toISOString() };
+  const { error } = await sb.from("requests").update(patch).eq("id", id);
+  if(error){ err("Não foi possível cancelar: "+error.message); return; }
+  const local = state.requests.find((x) => x.id === id);
+  if(local) Object.assign(local, patch);
+  invalidateArchiveCacheEntry_(local || Object.assign({}, r, patch));
+  ok("Solicitação cancelada.");
+  await loadDetalhe(id);
+  callEmailService("status_mudou", { id, novoStatus: "cancelada", canceladoPeloSolicitante: true });
 }
 async function excluirSolicitacao(id){
   if(!confirm("Excluir esta solicitação definitivamente? Essa ação não pode ser desfeita.")) return;
@@ -972,7 +1092,7 @@ function viewNova(){
   const depOpts = '<option value="">Selecione</option>'+
     state.departments.map((d) => '<option value="'+d.id+'"'+(d.id===n.target?" selected":"")+'>'+esc(d.name)+'</option>').join("");
   const prioOpts = Object.entries(PRIORITY_LABEL).map(([v,l]) => '<option value="'+v+'"'+(v===n.priority?" selected":"")+'>'+l+'</option>').join("");
-  const userOpts = '<option value="">Definir depois</option>'+
+  const userOpts = '<option value="">Selecione o responsável</option>'+
     depUsers.map((p) => '<option value="'+p.id+'"'+(p.id===n.assignee?" selected":"")+'>'+esc(p.full_name || p.email)+'</option>').join("");
 
   const dyn = fields.length ? '<div class="space-y-4 rounded-lg bg-surface p-4">'+
@@ -1011,7 +1131,7 @@ function viewNova(){
       '<div class="grid gap-4 sm:grid-cols-3">'+
         '<div><label class="lbl">Prioridade</label><select class="inp" onchange="state.novo.priority=this.value">'+prioOpts+'</select></div>'+
         '<div><label class="lbl">Prazo de finalização</label><input class="inp" type="date" value="'+esc(n.due)+'" onchange="state.novo.due=this.value" /></div>'+
-        '<div><label class="lbl">Responsável (opcional)</label><select class="inp" onchange="state.novo.assignee=this.value">'+userOpts+'</select></div>'+
+        '<div><label class="lbl">Responsável <span class="text-destructive">*</span></label><select class="inp" onchange="state.novo.assignee=this.value">'+userOpts+'</select></div>'+
       '</div>'+
       (selectedType && selectedType.needs_fiscal_registration ? '<p class="rounded-lg bg-surface p-3 text-xs text-muted-foreground">Este tipo de solicitação pode passar pela etapa "Cadastro fiscal". Quando isso acontecer, o responsável será automaticamente '+esc(selectedType.fiscal_assignee_id ? nameById(selectedType.fiscal_assignee_id) : "definido pelo tipo")+'.</p>' : "")+
       '<div class="flex justify-end gap-2 border-t border-border pt-4">'+
@@ -1053,6 +1173,7 @@ async function criarSolicitacao(e){
   const n = state.novo;
   if(n.title.trim().length < 3) return err("Descreva a atividade em um título."), false;
   if(!n.target) return err("Selecione o departamento solicitado."), false;
+  if(!n.assignee) return err("Selecione o responsável. Toda solicitação precisa ter um responsável definido."), false;
   const type = state.types.find((t) => t.id === n.typeId);
   const fields = parseFields(type && type.fields);
   const missingText = fields.find((f) => f.type !== "anexo" && f.required && !(n.formData[f.id]||"").trim());
@@ -1138,7 +1259,7 @@ const AGENDA_RANGES = [
 function viewAgenda(){
   const a = state.agenda;
   const today = todayISO();
-  const viewingOther = a.viewUserId && a.viewUserId !== state.user.id;
+  const viewingOther = state.isMaster && a.viewUserId && a.viewUserId !== state.user.id;
   const targetUserId = viewingOther ? a.viewUserId : state.user.id;
   const targetTasks = viewingOther
     ? (agendaOtherCache.userId === a.viewUserId ? agendaOtherCache.tasks : (loadAgendaFor(a.viewUserId), []))
@@ -1220,7 +1341,7 @@ function viewAgenda(){
       '<div><h1 class="text-3xl font-bold">'+(viewingOther ? "Agenda de "+esc(nameById(a.viewUserId)) : "Minha agenda")+'</h1>'+
       '<p class="mt-1 text-sm text-muted-foreground">'+pending+' atividades sob responsabilidade'+(viewingOther?" dessa pessoa":"")+'. Atrasadas aparecem em Hoje.</p></div>'+
       '<div class="flex flex-wrap items-center gap-2">'+
-        '<select class="inp w-56" onchange="state.agenda.viewUserId=this.value;loadAgendaFor(this.value)">'+userOpts+'</select>'+
+        (state.isMaster ? '<select class="inp w-56" onchange="state.agenda.viewUserId=this.value;loadAgendaFor(this.value)">'+userOpts+'</select>' : "")+
         '<select class="inp w-44" onchange="state.filters.agendaRange=this.value;render()">'+rangeOpts+'</select>'+
         '<button class="btn btn-outline btn-sm" onclick="state.agenda.showDone=!state.agenda.showDone;render()">'+(a.showDone?"Ocultar concluídas":"Mostrar concluídas")+'</button>'+
         (viewingOther ? "" : '<button class="btn btn-primary btn-sm" onclick="state.agenda.showForm=!state.agenda.showForm;render()">'+I.plus+' Atividade avulsa</button>')+
@@ -1242,7 +1363,7 @@ function agendaRequestItem(r, overdue){
     '<div class="min-w-0 flex-1"><a href="#/solicitacao/'+r.id+'" class="font-display text-sm font-semibold hover:underline">'+esc(r.title)+'</a>'+
     '<p class="mt-1 text-xs text-muted-foreground">Solicitação #'+pad4(r.code)+' · '+esc(depById(r.target_department_id))+' · '+STATUS_LABEL[r.status]+'</p></div>'+
     overdueBadge(overdue)+
-    '<span class="rounded-full px-2 py-0.5 text-[11px] font-medium '+PRIORITY_CLASS[r.priority]+'">'+PRIORITY_LABEL[r.priority]+'</span></li>';
+    '<span class="rounded-full px-2 py-0.5 text-[11px] font-medium '+PRIORITY_CLASS[prioridadeDe(r)]+'">'+PRIORITY_LABEL[prioridadeDe(r)]+'</span></li>';
 }
 function agendaTaskItem(t, overdue, readOnly){
   return '<li class="flex items-start gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card">'+
@@ -1318,6 +1439,20 @@ function viewDetalhe(id){
   const d = state.detalhe;
   if(!d.request || d.request.id !== id){ loadDetalhe(id); return '<p class="text-sm text-muted-foreground">Carregando…</p>'; }
   const r = d.request;
+  // Quem pode abrir esta solicitação: master, o responsável por ela, ou quem a abriu.
+  const souResponsavel = r.assignee_id === state.user.id;
+  const souSolicitante = r.requester_id === state.user.id;
+  if(!state.isMaster && !souResponsavel && !souSolicitante){
+    return '<div class="rounded-xl border border-border bg-card p-8 text-center shadow-card">'+
+      '<p class="text-sm text-muted-foreground">Esta solicitação não está sob sua responsabilidade e não foi aberta por você.</p>'+
+      '<a href="#'+(podeExecutar() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm mt-4">Voltar</a></div>';
+  }
+  // Só quem executa (ou master) altera status/responsável/prazo; solicitante
+  // acompanha e comenta, mas não muda o andamento.
+  const podeEditar = state.isMaster || (podeExecutar() && souResponsavel);
+  // O solicitante pode cancelar a própria solicitação enquanto ela não estiver
+  // concluída ou já cancelada (mesmo sem poder mexer no resto do andamento).
+  const podeCancelar = !podeEditar && souSolicitante && r.status !== "concluida" && r.status !== "cancelada";
   const type = state.types.find((t) => t.id === r.request_type_id);
   const fields = parseFields(type && type.fields);
   const answers = r.form_data || {};
@@ -1343,11 +1478,11 @@ function viewDetalhe(id){
     : '<p class="text-sm text-muted-foreground">Nenhum registro ainda.</p>';
 
   return '<div class="mx-auto max-w-5xl">'+
-    '<a href="#/painel" class="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">'+I.arrowLeft+' Voltar ao quadro</a>'+
+    '<a href="#'+(podeExecutar()?"/painel":"/acompanhamento")+'" class="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">'+I.arrowLeft+(podeExecutar()?' Voltar ao quadro':' Voltar ao acompanhamento')+'</a>'+
     '<div class="mt-4 flex flex-wrap items-center gap-3">'+
       '<span class="font-mono text-sm text-muted-foreground">#'+pad4(r.code)+'</span>'+
       '<span class="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium"><span class="size-2 rounded-full '+STATUS_DOT[r.status]+'"></span>'+STATUS_LABEL[r.status]+'</span>'+
-      '<span class="rounded-full px-3 py-1 text-xs font-medium '+PRIORITY_CLASS[r.priority]+'">'+PRIORITY_LABEL[r.priority]+'</span>'+
+      '<span class="rounded-full px-3 py-1 text-xs font-medium '+PRIORITY_CLASS[prioridadeDe(r)]+'">'+PRIORITY_LABEL[prioridadeDe(r)]+'</span>'+
     '</div>'+
     '<h1 class="mt-3 text-3xl font-bold">'+esc(r.title)+'</h1>'+
     '<div class="mt-8 grid gap-6 lg:grid-cols-[1fr_320px]"><div class="space-y-6">'+
@@ -1364,7 +1499,7 @@ function viewDetalhe(id){
       '</section>'+
     '</div>'+
     '<aside class="space-y-4 rounded-xl border border-border bg-card p-6 shadow-card h-fit">'+
-      '<div><label class="lbl">Solicitante</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{requester_id:this.value||null})">'+
+      '<div><label class="lbl">Solicitante</label><select class="inp"'+(state.isMaster?"":" disabled")+' onchange="atualizarSolicitacao(\''+r.id+'\',{requester_id:this.value||null})">'+
         '<option value="">Não definido</option>'+depUsers.map((p) => '<option value="'+p.id+'"'+(p.id===r.requester_id?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("")+
       '</select></div>'+
       field("Departamento solicitante", r.requester_department_id ? depById(r.requester_department_id) : "—")+
@@ -1372,17 +1507,23 @@ function viewDetalhe(id){
       field("Tipo", type ? (type.name + (type.tag ? " · "+type.tag : "")) : "Livre")+
       field("Aberta em", formatDate(r.created_at))+
       '<div class="space-y-2 border-t border-border pt-4"><label class="lbl">Status</label>'+
-        '<select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{status:this.value,completed_at:(this.value===\'concluida\'||this.value===\'cancelada\')?new Date().toISOString():null})">'+statusOpts+'</select></div>'+
-      '<div><label class="lbl">Prioridade</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{priority:this.value})">'+prioOpts+'</select></div>'+
-      '<div><label class="lbl">Responsável</label><select class="inp" onchange="atualizarSolicitacao(\''+r.id+'\',{assignee_id:this.value||null})">'+userOpts+'</select></div>'+
+        '<select class="inp"'+(podeEditar?"":" disabled")+' onchange="atualizarSolicitacao(\''+r.id+'\',{status:this.value,completed_at:(this.value===\'concluida\'||this.value===\'cancelada\')?new Date().toISOString():null})">'+statusOpts+'</select></div>'+
+      '<div><label class="lbl">Prioridade</label><select class="inp"'+(podeEditar?"":" disabled")+' onchange="atualizarSolicitacao(\''+r.id+'\',{priority:this.value})">'+prioOpts+'</select></div>'+
+      '<div><label class="lbl">Responsável</label><select class="inp"'+(podeEditar?"":" disabled")+' onchange="atualizarSolicitacao(\''+r.id+'\',{assignee_id:this.value||null})">'+userOpts+'</select></div>'+
       '<div><label class="lbl">Prazo de finalização</label>'+
-        '<input class="inp" type="date" value="'+(r.due_date||"")+'" onchange="atualizarSolicitacao(\''+r.id+'\',{due_date:this.value||null})" />'+
+        '<input class="inp" type="date"'+(podeEditar?"":" disabled")+' value="'+(r.due_date||"")+'" onchange="atualizarSolicitacao(\''+r.id+'\',{due_date:this.value||null})" />'+
         '<p class="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground"><span style="width:.875rem;height:.875rem;display:inline-flex">'+I.calendarClock+'</span>'+deadlineLabel(r.due_date, r.status)+'</p></div>'+
+      (podeCancelar ? '<button type="button" class="btn btn-outline w-full text-destructive" onclick="cancelarMinhaSolicitacao(\''+r.id+'\')">Cancelar esta solicitação</button>' : "")+
       (state.isMaster ? '<button type="button" class="btn btn-outline w-full text-destructive" onclick="excluirSolicitacao(\''+r.id+'\')">'+I.trash+' Excluir solicitação</button>' : "")+
     '</aside></div></div>';
 }
 async function atualizarSolicitacao(id, patch){
   const antes = state.requests.find((x) => x.id === id);
+  if("assignee_id" in patch && !patch.assignee_id){
+    err("Toda solicitação precisa ter um responsável. Escolha outra pessoa em vez de deixar em branco.");
+    render();
+    return;
+  }
   if(patch.status === "cadastro_fiscal"){
     const r = antes;
     if(r && !typeAllowsFiscal(r)){ err('Este tipo de solicitação não usa a etapa "Cadastro fiscal".'); return; }
@@ -1452,6 +1593,14 @@ function viewTipos(){
   return '<div class="mx-auto max-w-5xl"><h1 class="text-3xl font-bold">Tipos de solicitação</h1>'+
     '<p class="mt-1 text-sm text-muted-foreground">Monte formulários próprios para cada tipo e departamento. Eles aparecem ao abrir uma nova solicitação.</p>'+
     (!state.isMaster ? '<p class="mt-6 rounded-lg border border-border bg-surface p-4 text-sm text-muted-foreground">Você pode consultar os tipos existentes. A criação e edição são restritas ao acesso master.</p>' : "")+
+    (function(){
+      const semDono = state.types.filter((ty) => ty.is_active && !ty.owner_id);
+      if(!semDono.length || !state.isMaster) return "";
+      return '<div class="mt-6 rounded-lg border border-destructive/40 bg-destructive/5 p-4 text-sm">'+
+        '<p class="font-semibold text-destructive">'+semDono.length+' tipo(s) sem responsável definido</p>'+
+        '<p class="mt-1 text-xs text-muted-foreground">Toda solicitação precisa nascer com um responsável. Enquanto estes tipos estiverem sem responsável, as solicitações criadas por eles ficarão sem dono. Edite cada um e defina o responsável:</p>'+
+        '<p class="mt-2 text-xs">'+semDono.map((ty) => esc(ty.name)).join(" · ")+'</p></div>';
+    })()+
     '<div class="mt-8 grid gap-6 lg:grid-cols-2">'+
       '<form onsubmit="return criarTipo(event)" class="space-y-5 rounded-xl border border-border bg-card p-6 shadow-card h-fit">'+
         '<h2 class="text-sm font-semibold">'+(t.editingId ? "Editar tipo" : "Novo tipo")+'</h2>'+
@@ -1512,6 +1661,7 @@ async function criarTipo(e){
   if(t.name.trim().length < 3) return err("Informe o nome do tipo."), false;
   if(!t.departmentId) return err("Selecione o departamento responsável."), false;
   if(t.fields.some((f) => f.label.trim().length === 0)) return err("Todos os campos precisam de um nome."), false;
+  if(!t.ownerId) return err("Selecione o responsável deste tipo. Toda solicitação criada por ele nasce com esse responsável."), false;
   if(t.needsFiscal && !t.fiscalAssigneeId) return err("Selecione o responsável pelo cadastro fiscal."), false;
   const payload = {
     name: t.name.trim(), description: t.description.trim(), department_id: t.departmentId,
@@ -1680,18 +1830,27 @@ function viewPessoas(){
       '<div class="mt-4 grid gap-2 sm:grid-cols-2">'+listaDeps+'</div>'+
     '</section>'+
     '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
-      '<h2 class="text-sm font-semibold">Papéis de acesso</h2>'+
-      '<p class="mt-1 text-xs text-muted-foreground">O acesso master pode gerenciar tipos de solicitação, cadastrar pessoas, conceder/revogar master de outras pessoas e excluir solicitações. E-mails marcados como "fixo no código" têm master garantido pelo próprio arquivo do app, mesmo sem registro no banco.</p>'+
+      '<h2 class="text-sm font-semibold">Níveis de acesso</h2>'+
+      '<p class="mt-1 text-xs text-muted-foreground">'+
+        ACCESS_LEVELS.map((l) => '<strong>'+l.label+':</strong> '+l.desc).join(' · ')+
+        '. Quem ainda não tem nível definido entra como Solicitante. E-mails marcados como "fixo no código" são master pelo próprio arquivo do app, mesmo sem registro no banco.</p>'+
       '<div class="mt-4 overflow-x-auto"><table class="w-full text-sm">'+
-        '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground"><th class="pb-2 font-medium">Pessoa</th><th class="pb-2 font-medium">Master</th></tr></thead>'+
-        '<tbody>'+state.profiles.map((pr) => '<tr class="border-b border-border/60 last:border-0">'+
+        '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground"><th class="pb-2 font-medium">Pessoa</th><th class="pb-2 font-medium">Nível de acesso</th></tr></thead>'+
+        '<tbody>'+state.profiles.map((pr) => {
+          const nivel = levelOf(pr.id);
+          const travado = pr.id === state.user.id || isHardcodedMaster(pr.email);
+          const motivo = pr.id === state.user.id ? "Você não pode alterar seu próprio nível aqui"
+            : "Este e-mail é master fixado no código, não pelo banco";
+          const opts = ACCESS_LEVELS.map((l) => '<option value="'+l.value+'"'+(l.value===nivel?" selected":"")+'>'+l.label+'</option>').join("");
+          return '<tr class="border-b border-border/60 last:border-0">'+
           '<td class="py-2 pr-3"><p class="font-medium">'+esc(pr.full_name||"—")+'</p><p class="text-xs text-muted-foreground">'+esc(pr.email)+'</p></td>'+
-          '<td class="py-2 pr-3"><button type="button" class="switch" data-on="'+(hasRole(pr.id,"master")?1:0)+'" '+
-            (pr.id===state.user.id ? 'title="Você não pode remover seu próprio acesso master aqui" disabled style="opacity:.5;cursor:not-allowed"'
-            : isHardcodedMaster(pr.email) ? 'title="Este e-mail é master fixado no código, não pelo banco" disabled style="opacity:.5;cursor:not-allowed"'
-            : 'onclick="toggleRole(\''+pr.id+'\',\'master\','+(!hasRole(pr.id,"master"))+')"')+
-          '></button>'+(isHardcodedMaster(pr.email) ? '<span class="ml-1 text-[10px] text-muted-foreground">(fixo no código)</span>' : "")+'</td>'+
-        '</tr>').join("")+
+          '<td class="py-2 pr-3">'+
+            (travado
+              ? '<span class="rounded-full bg-secondary px-2.5 py-1 text-xs" title="'+motivo+'">'+ACCESS_LEVEL_LABEL[nivel]+'</span>'+
+                (isHardcodedMaster(pr.email) ? '<span class="ml-1 text-[10px] text-muted-foreground">(fixo no código)</span>' : '<span class="ml-1 text-[10px] text-muted-foreground">(você)</span>')
+              : '<select class="inp w-56" onchange="definirNivelAcesso(\''+pr.id+'\',this.value)">'+opts+'</select>')+
+          '</td></tr>';
+        }).join("")+
         '</tbody></table></div>'+
     '</section>'+
     '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
@@ -1755,17 +1914,20 @@ async function excluirDepartamento(id, name){
   if(error){ err("Não foi possível excluir: pode haver solicitações ou tipos usando este departamento."); return; }
   await refreshDepartments(); ok("Departamento excluído."); render();
 }
-async function toggleRole(userId, role, grant){
-  if(grant){
-    const { error } = await sb.from("user_roles").insert({ user_id: userId, role });
-    if(error){ err("Não foi possível conceder o papel."); return; }
-  } else {
-    const { error } = await sb.from("user_roles").delete().eq("user_id", userId).eq("role", role);
-    if(error){ err("Não foi possível remover o papel."); return; }
+async function definirNivelAcesso(userId, nivel){
+  if(!ACCESS_LEVELS.some((l) => l.value === nivel)) return err("Nível inválido.");
+  // Remove qualquer nível anterior dessa pessoa e grava só o novo (um por pessoa).
+  for(const l of ACCESS_LEVELS){
+    if(l.value !== nivel && state.allRoles.some((r) => r.user_id === userId && r.role === l.value)){
+      await sb.from("user_roles").delete().eq("user_id", userId).eq("role", l.value);
+    }
   }
+  const { error } = await sb.from("user_roles").insert({ user_id: userId, role: nivel });
+  if(error){ err("Não foi possível salvar o nível de acesso."); return; }
   await refreshRoles();
-  if(userId === state.user.id){ state.isMaster = hasRole(userId,"master"); }
-  ok("Papéis atualizados."); render();
+  const pessoa = state.profiles.find((p) => p.id === userId);
+  ok('Nível de "'+((pessoa && pessoa.full_name) || "pessoa")+'" definido como '+ACCESS_LEVEL_LABEL[nivel]+".");
+  render();
 }
 
 async function mesclarPerfis(keepId, removeId){
@@ -1821,11 +1983,31 @@ async function mesclarPerfis(keepId, removeId){
 const PERIODS = [
   { value:"30", label:"Últimos 30 dias" }, { value:"90", label:"Últimos 90 dias" },
   { value:"365", label:"Últimos 12 meses" }, { value:"todos", label:"Todo o período" },
+  { value:"custom", label:"Período específico…" },
 ];
+// Diferença em dias entre a conclusão e o prazo:
+//  negativo = concluída ANTES do prazo (adiantada)
+//  zero     = concluída exatamente no prazo
+//  positivo = concluída DEPOIS do prazo (atrasada)
+//  null     = não dá para calcular (sem prazo ou ainda não concluída)
+function desvioPrazo(r){
+  if(!r.completed_at || !r.due_date) return null;
+  const concl = new Date(String(r.completed_at).slice(0,10)+"T12:00:00").getTime();
+  const prazo = new Date(String(r.due_date).slice(0,10)+"T12:00:00").getTime();
+  return Math.round((concl - prazo)/86400000);
+}
+function desvioLabel(d){
+  if(d === null) return "";
+  if(d === 0) return "0 (no prazo)";
+  return (d > 0 ? "+" : "") + d;
+}
 function relatorioRows(){
   let list = state.requests.slice();
-  const { relPeriod, relDep } = state.filters;
-  if(relPeriod !== "todos"){
+  const { relPeriod, relDep, relFrom, relTo } = state.filters;
+  if(relPeriod === "custom"){
+    if(relFrom) list = list.filter((r) => String(r.created_at).slice(0,10) >= relFrom);
+    if(relTo) list = list.filter((r) => String(r.created_at).slice(0,10) <= relTo);
+  } else if(relPeriod !== "todos"){
     const limit = Date.now() - Number(relPeriod)*86400000;
     list = list.filter((r) => new Date(r.created_at).getTime() >= limit);
   }
@@ -1852,14 +2034,25 @@ function viewRelatorios(){
   }).filter((d) => d.total > 0).sort((a,b) => b.total - a.total);
 
   const map = new Map();
+  const hojeISO = todayISO();
   rows.forEach((r) => {
     const key = r.assignee_id || "sem";
-    const e = map.get(key) || { total:0, open:0, done:0 };
-    e.total++; if(r.status === "concluida") e.done++; else if(r.status !== "cancelada") e.open++;
+    const e = map.get(key) || { total:0, open:0, done:0, atrasadas:0, concluidasComAtraso:0, somaDesvio:0, comDesvio:0 };
+    e.total++;
+    if(r.status === "concluida") e.done++; else if(r.status !== "cancelada") e.open++;
+    // Em atraso agora (ainda aberta e passou do prazo)
+    if(r.status !== "concluida" && r.status !== "cancelada" && r.due_date && String(r.due_date) < hojeISO) e.atrasadas++;
+    const desvio = desvioPrazo(r);
+    if(desvio !== null){
+      e.somaDesvio += desvio; e.comDesvio++;
+      if(desvio > 0) e.concluidasComAtraso++;
+    }
     map.set(key, e);
   });
-  const byAssignee = [...map.entries()].map(([id,v]) => ({ name: id === "sem" ? "Sem responsável" : nameById(id), ...v }))
-    .sort((a,b) => b.total - a.total).slice(0,8);
+  const byAssignee = [...map.entries()].map(([id,v]) => ({
+    name: id === "sem" ? "Sem responsável" : nameById(id), ...v,
+    mediaDesvio: v.comDesvio ? (v.somaDesvio/v.comDesvio) : null,
+  })).sort((a,b) => b.total - a.total).slice(0,8);
 
   const periodOpts = PERIODS.map((p) => '<option value="'+p.value+'"'+(p.value===state.filters.relPeriod?" selected":"")+'>'+p.label+'</option>').join("");
   const depOpts = '<option value="todos">Todos os departamentos</option>'+state.departments.map((d) => '<option value="'+d.id+'"'+(d.id===state.filters.relDep?" selected":"")+'>'+esc(d.name)+'</option>').join("");
@@ -1891,6 +2084,11 @@ function viewRelatorios(){
     '<p class="mt-1 text-sm text-muted-foreground">Indicadores gerados a partir das solicitações da central de serviços.</p></div>'+
     '<div class="flex flex-wrap items-center gap-2">'+
       '<select class="inp w-48" onchange="state.filters.relPeriod=this.value;render()">'+periodOpts+'</select>'+
+      (state.filters.relPeriod === "custom"
+        ? '<input class="inp w-40" type="date" title="Data inicial" value="'+esc(state.filters.relFrom)+'" onchange="state.filters.relFrom=this.value;render()" />'+
+          '<span class="text-xs text-muted-foreground">até</span>'+
+          '<input class="inp w-40" type="date" title="Data final" value="'+esc(state.filters.relTo)+'" onchange="state.filters.relTo=this.value;render()" />'
+        : "")+
       '<select class="inp w-56" onchange="state.filters.relDep=this.value;render()">'+depOpts+'</select>'+
       '<button class="btn btn-outline" onclick="exportCsv()">'+I.download+' Exportar CSV</button>'+
     '</div></div>'+
@@ -1908,24 +2106,49 @@ function viewRelatorios(){
       panel("Distribuição por status", statusBars)+
       panel("Distribuição por prioridade", prioBars)+
       panel("Carga por departamento solicitado", table(["Departamento","Total","Abertas","Atrasadas"], byDepartment.map((d) => [d.name,d.total,d.open,d.overdue]), "Nenhuma solicitação no período."))+
-      panel("Produtividade por responsável", table(["Responsável","Total","Abertas","Concluídas"], byAssignee.map((a) => [a.name,a.total,a.open,a.done]), "Nenhuma solicitação no período."))+
+      panel("Produtividade por responsável", table(
+        ["Responsável","Total","Abertas","Concluídas","Em atraso","Concluídas com atraso","Média vs. prazo"],
+        byAssignee.map((a) => [
+          a.name, a.total, a.open, a.done, a.atrasadas, a.concluidasComAtraso,
+          a.mediaDesvio === null ? "—" : (a.mediaDesvio > 0 ? "+" : "") + a.mediaDesvio.toFixed(1) + " d",
+        ]), "Nenhuma solicitação no período."))+
     '</div>'+
-    panel("Solicitações em atraso", table(["Código","Título","Departamento","Responsável","Prazo"],
+    panel("Solicitações em atraso", table(["Código","Título","Departamento","Responsável","Prazo","Dias de atraso"],
       overdue.slice().sort((a,b) => (a.due_date||"").localeCompare(b.due_date||"")).map((r) => [
         "#"+pad4(r.code), r.title, depById(r.target_department_id),
         r.assignee_id ? nameById(r.assignee_id) : "Sem responsável", formatDate(r.due_date),
+        "+" + Math.max(1, Math.round((new Date(todayISO()+"T12:00:00") - new Date(String(r.due_date).slice(0,10)+"T12:00:00"))/86400000)),
       ]), "Nenhuma solicitação em atraso. 🎉"), "mt-4")+
+    panel("Cumprimento de prazo (concluídas)", table(["Código","Título","Responsável","Prazo","Concluída em","Dias vs. prazo","Situação"],
+      done.filter((r) => desvioPrazo(r) !== null)
+        .sort((a,b) => desvioPrazo(b) - desvioPrazo(a))
+        .slice(0, 40)
+        .map((r) => {
+          const d = desvioPrazo(r);
+          return ["#"+pad4(r.code), r.title, r.assignee_id ? nameById(r.assignee_id) : "—",
+            formatDate(r.due_date), formatDate(r.completed_at), desvioLabel(d), d > 0 ? "Atrasada" : "No prazo"];
+        }), "Nenhuma solicitação concluída com prazo definido no período."), "mt-4")+
   '</div>';
 }
 function exportCsv(){
   const rows = relatorioRows();
-  const header = ["codigo","titulo","status","prioridade","solicitante","responsavel","departamento_solicitado","criada_em","prazo","concluida_em"];
-  const lines = rows.map((r) => [
-    pad4(r.code), r.title, STATUS_LABEL[r.status], PRIORITY_LABEL[r.priority],
-    nameById(r.requester_id), r.assignee_id ? nameById(r.assignee_id) : "",
-    depById(r.target_department_id), formatDate(r.created_at),
-    r.due_date ? formatDate(r.due_date) : "", r.completed_at ? formatDate(r.completed_at) : "",
-  ].map((v) => '"'+String(v).replace(/"/g,'""')+'"').join(";"));
+  const hojeISO = todayISO();
+  const header = ["codigo","titulo","status","prioridade","solicitante","responsavel","departamento_solicitado","criada_em","prazo","concluida_em","situacao_prazo","dias_vs_prazo"];
+  const lines = rows.map((r) => {
+    const desvio = desvioPrazo(r);
+    let situacao = "";
+    if(desvio !== null) situacao = desvio > 0 ? "Atrasada" : "No prazo";
+    else if(r.status !== "concluida" && r.status !== "cancelada" && r.due_date){
+      situacao = String(r.due_date) < hojeISO ? "Em atraso (em aberto)" : "Dentro do prazo (em aberto)";
+    }
+    return [
+      pad4(r.code), r.title, STATUS_LABEL[r.status], PRIORITY_LABEL[prioridadeDe(r)],
+      nameById(r.requester_id), r.assignee_id ? nameById(r.assignee_id) : "",
+      depById(r.target_department_id), formatDate(r.created_at),
+      r.due_date ? formatDate(r.due_date) : "", r.completed_at ? formatDate(r.completed_at) : "",
+      situacao, desvio === null ? "" : desvio,
+    ].map((v) => '"'+String(v).replace(/"/g,'""')+'"').join(";");
+  });
   const blob = new Blob(["\uFEFF"+header.join(";")+"\n"+lines.join("\n")], { type:"text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
