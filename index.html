@@ -1131,7 +1131,11 @@ function viewNova(){
       '<div class="grid gap-4 sm:grid-cols-3">'+
         '<div><label class="lbl">Prioridade</label><select class="inp" onchange="state.novo.priority=this.value">'+prioOpts+'</select></div>'+
         '<div><label class="lbl">Prazo de finalização</label><input class="inp" type="date" value="'+esc(n.due)+'" onchange="state.novo.due=this.value" /></div>'+
-        '<div><label class="lbl">Responsável <span class="text-destructive">*</span></label><select class="inp" onchange="state.novo.assignee=this.value">'+userOpts+'</select></div>'+
+        (state.isMaster
+          ? '<div><label class="lbl">Responsável <span class="text-destructive">*</span></label><select class="inp" onchange="state.novo.assignee=this.value">'+userOpts+'</select></div>'
+          : '<div><label class="lbl">Responsável</label>'+
+            '<p class="inp flex items-center bg-surface text-muted-foreground">'+esc(n.assignee ? nameById(n.assignee) : "Definido pelo tipo de solicitação")+'</p>'+
+            '<p class="mt-1 text-xs text-muted-foreground">Definido automaticamente pelo tipo escolhido.</p></div>')+
       '</div>'+
       (selectedType && selectedType.needs_fiscal_registration ? '<p class="rounded-lg bg-surface p-3 text-xs text-muted-foreground">Este tipo de solicitação pode passar pela etapa "Cadastro fiscal". Quando isso acontecer, o responsável será automaticamente '+esc(selectedType.fiscal_assignee_id ? nameById(selectedType.fiscal_assignee_id) : "definido pelo tipo")+'.</p>' : "")+
       '<div class="flex justify-end gap-2 border-t border-border pt-4">'+
@@ -1173,7 +1177,11 @@ async function criarSolicitacao(e){
   const n = state.novo;
   if(n.title.trim().length < 3) return err("Descreva a atividade em um título."), false;
   if(!n.target) return err("Selecione o departamento solicitado."), false;
-  if(!n.assignee) return err("Selecione o responsável. Toda solicitação precisa ter um responsável definido."), false;
+  if(!n.assignee){
+    return err(state.isMaster
+      ? "Selecione o responsável. Toda solicitação precisa ter um responsável definido."
+      : "Este tipo de solicitação ainda não tem responsável configurado. Avise o administrador antes de continuar."), false;
+  }
   const type = state.types.find((t) => t.id === n.typeId);
   const fields = parseFields(type && type.fields);
   const missingText = fields.find((f) => f.type !== "anexo" && f.required && !(n.formData[f.id]||"").trim());
@@ -1428,10 +1436,15 @@ async function loadDetalhe(id){
   state.detalhe.loading = true;
   const [req, cmts] = await Promise.all([
     sb.from("requests").select("*").eq("id", id).single(),
-    sb.from("request_comments").select("*").eq("request_id", id).order("created_at"),
+    // Sem .order() aqui de propósito: filtro + ordenação juntos exigiriam um
+    // índice composto no Firestore, e sem ele a consulta volta vazia. A
+    // ordenação é feita logo abaixo, no próprio app.
+    sb.from("request_comments").select("*").eq("request_id", id),
   ]);
   state.detalhe.request = req.data || null;
-  state.detalhe.comments = cmts.data || [];
+  state.detalhe.comments = (cmts.data || []).slice()
+    .sort((a,b) => String(a.created_at||"").localeCompare(String(b.created_at||"")));
+  if(cmts.error) err("Não foi possível carregar os comentários: "+cmts.error.message);
   state.detalhe.loading = false;
   render();
 }
