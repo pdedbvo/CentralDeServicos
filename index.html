@@ -341,23 +341,57 @@ const PRIORITY_CLASS = {
 const FIELD_TYPES = [
   { value:"text", label:"Texto curto" }, { value:"textarea", label:"Texto longo" },
   { value:"number", label:"Número" }, { value:"date", label:"Data" }, { value:"select", label:"Lista de opções" },
-  { value:"anexo", label:"Anexo (PNG/PDF)" },
+  { value:"anexo", label:"Anexo (arquivo)" },
 ];
-const ANEXO_ACCEPT = ".png,.pdf,image/png,application/pdf";
-const ANEXO_MAX_BYTES = 500 * 1024; // 500 KB — guardado direto no Firestore, sem Storage
+// Anexos vão para o SharePoint (via Google Apps Script) — o banco guarda só o
+// link. Por isso não há limite prático de tamanho nem restrição de formato.
+const ANEXO_ACCEPT = "";
+// Executáveis ficam de fora por segurança; o resto é livre.
+const ANEXO_BLOQUEADOS = /\.(exe|bat|cmd|com|scr|msi|vbs|js|jar|ps1|sh)$/i;
 function anexoIsValid(file){
   if(!file) return false;
-  const okType = file.type === "image/png" || file.type === "application/pdf";
-  const okExt = /\.(png|pdf)$/i.test(file.name || "");
-  return okType || okExt;
+  return !ANEXO_BLOQUEADOS.test(file.name || "");
 }
-function fileToDataUrl(file){
+// Lê o arquivo como base64 puro (sem o prefixo "data:"), formato esperado
+// pelo serviço de anexos.
+function fileToBase64(file){
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+/* ============================ Serviço de anexos (SharePoint) ============================ */
+async function callAnexoService(acao, payload){
+  const url = state.settings.anexos_gas_url;
+  const secret = state.settings.anexos_shared_secret;
+  if(!url || !secret) return { ok:false, erro:"not_configured" };
+  try{
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ secret, acao, ...payload }),
+    });
+    return await res.json();
+  } catch(e){
+    return { ok:false, erro: e.message || String(e) };
+  }
+}
+/** Sobe um arquivo e devolve { name, url, size } para gravar no form_data. */
+async function enviarAnexo(file, subpasta){
+  const base64 = await fileToBase64(file);
+  const r = await callAnexoService("sp_upload", {
+    nomeArquivo: file.name,
+    mimeType: file.type || "application/octet-stream",
+    base64: base64,
+    subpasta: subpasta || "",
+  });
+  if(!r.ok) throw new Error(r.erro === "not_configured"
+    ? "O serviço de anexos ainda não foi configurado (Administração > Configurações)."
+    : r.erro);
+  return { name: r.arquivo.nome, url: r.arquivo.link, size: r.arquivo.tamanho };
 }
 
 const LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="60 -729 4580 758"><g transform="scale(1,-1)"><path transform="translate(0,0)" d="M322 127H215V573H322C416 573 493 521 493 390V310C493 179 416 127 322 127ZM80 0H322C508 0 628 119 628 310V390C628 581 508 700 322 700H80Z" fill="#111111"/><path transform="translate(668,0)" d="M80 0H395C532 0 611 72 611 208C611 292 570 338 530 363C562 391 585 439 585 499C585 615 509 700 395 700H80ZM213 127V289H378C438 289 471 260 471 208C471 154 438 127 378 127ZM213 414V573H361C425 573 445 535 445 499C445 449 425 414 361 414Z" fill="#111111"/><path transform="translate(1314,0)" d="M191 0H449L630 700H489L320 25L151 700H10Z" fill="#111111"/><path transform="translate(1954,0)" d="M336 -9C512 -9 632 99 632 290V410C632 601 512 709 336 709C160 709 40 601 40 410V290C40 99 160 -9 336 -9ZM175 290V410C175 524 236 579 336 579C436 579 497 524 497 410V290C497 176 436 116 336 116C236 116 175 176 175 290Z" fill="#111111"/><path transform="translate(2626,0)" d="M541 0H609V700H541V392H174V700H106V0H174V327H541Z" fill="#111111"/><path transform="translate(3341,0)" d="M346 -9C510 -9 598 83 598 244V700H530V246C530 128 474 55 346 55C220 55 164 128 164 246V700H96V244C96 83 185 -9 346 -9Z" fill="#111111"/><path transform="translate(4035,0)" d="M106 0H379C518 0 585 78 585 200C585 293 537 347 474 367C518 389 559 435 559 516C559 625 483 700 372 700H106ZM173 63V332H366C462 332 517 285 517 200C517 116 467 63 370 63ZM173 393V637H354C440 637 491 591 491 516C491 430 432 393 354 393Z" fill="#111111"/></g></svg>';
@@ -520,6 +554,7 @@ const state = {
   pessoa: { editingId: null, name: "", email: "", active: true },
   departamento: { name: "" },
   detalhe: { request: null, comments: [], comment: "", loading: false },
+  uploading: null, // { total, feito, nome } enquanto anexos sobem para o SharePoint
   ready: false,
 };
 
@@ -878,6 +913,16 @@ function shell(children, path){
         '</nav>'+
       '</div>'+
     '</header>'+
+    (state.uploading
+      ? '<div class="fixed bottom-4 left-1/2 z-40 -translate-x-1/2 rounded-lg border border-border bg-card px-4 py-3 shadow-card">'+
+        '<p class="flex items-center gap-2 text-sm">'+
+          '<span class="inline-block size-3 animate-spin rounded-full border-2 border-border border-t-foreground"></span>'+
+          'Enviando anexo'+(state.uploading.total > 1 ? " "+(state.uploading.feito+1)+" de "+state.uploading.total : "")+
+          (state.uploading.nome ? ' — '+esc(state.uploading.nome) : "")+'…'+
+        '</p>'+
+        '<p class="mt-1 text-xs text-muted-foreground">Aguarde, isso pode levar alguns segundos.</p>'+
+      '</div>'
+      : "")+
     '<main class="mx-auto max-w-[1400px] px-4 py-8 sm:px-6">'+children+'</main>'+
   '</div>';
 }
@@ -1202,9 +1247,9 @@ function viewNova(){
       let input;
       if(f.type === "anexo"){
         const chosen = n.files[f.id];
-        input = '<input class="inp" type="file" accept="'+ANEXO_ACCEPT+'" onchange="handleAnexoSelect(event,\''+f.id+'\')" />'+
-          (chosen ? '<p class="mt-1 text-xs text-muted-foreground">Selecionado: '+esc(chosen.name)+' ('+Math.round(chosen.size/1024)+' KB)</p>' : "")+
-          '<p class="mt-1 text-xs text-muted-foreground">Formatos aceitos: PNG ou PDF, até 500 KB.</p>';
+        input = '<input class="inp" type="file" onchange="handleAnexoSelect(event,\''+f.id+'\')" />'+
+          (chosen ? '<p class="mt-1 text-xs text-muted-foreground">Selecionado: '+esc(chosen.name)+' ('+formatarTamanho(chosen.size)+')</p>' : "")+
+          '<p class="mt-1 text-xs text-muted-foreground">O arquivo será enviado para o SharePoint ao criar a solicitação.</p>';
       }
       else if(f.type === "textarea") input = '<textarea class="inp" rows="3" maxlength="1000" oninput="state.novo.formData[\''+f.id+'\']=this.value">'+val+'</textarea>';
       else if(f.type === "select") input = '<select class="inp" onchange="state.novo.formData[\''+f.id+'\']=this.value"><option value="">Selecione</option>'+
@@ -1243,11 +1288,16 @@ function viewNova(){
       '</div>'+
     '</form></div>';
 }
+function formatarTamanho(bytes){
+  if(!bytes && bytes !== 0) return "";
+  if(bytes < 1024) return bytes + " B";
+  if(bytes < 1024*1024) return Math.round(bytes/1024) + " KB";
+  return (bytes/(1024*1024)).toFixed(1) + " MB";
+}
 function handleAnexoSelect(e, fieldId){
   const file = e.target.files && e.target.files[0];
-  if(file && !anexoIsValid(file)){ err("Anexo inválido. Envie um arquivo PNG ou PDF."); e.target.value = ""; state.novo.files[fieldId] = null; render(); return; }
-  if(file && file.size > ANEXO_MAX_BYTES){
-    err("Esse arquivo tem "+Math.round(file.size/1024)+" KB — o limite é 500 KB. Tente comprimir ou reduzir a qualidade do PNG/PDF.");
+  if(file && !anexoIsValid(file)){
+    err("Por segurança, arquivos executáveis não podem ser anexados.");
     e.target.value = ""; state.novo.files[fieldId] = null; render(); return;
   }
   state.novo.files[fieldId] = file || null;
@@ -1298,23 +1348,8 @@ async function criarSolicitacao(e){
     priority: n.priority, due_date: n.due || null, form_data: n.formData,
   }).select("id").single();
   if(error){ err("Não foi possível criar a solicitação."); return false; }
-
-  if(anexoFields.some((f) => n.files[f.id])){
-    const mergedFormData = { ...n.formData };
-    for(const f of anexoFields){
-      const file = n.files[f.id];
-      if(!file) continue;
-      try{
-        const dataUrl = await fileToDataUrl(file);
-        mergedFormData[f.id] = { name: file.name, url: dataUrl, size: file.size };
-      } catch(e){
-        err('Solicitação criada, mas o anexo "'+f.label+'" não pôde ser lido: '+(e.message||e));
-        continue;
-      }
-    }
-    await sb.from("requests").update({ form_data: mergedFormData }).eq("id", data.id);
-    data.form_data = mergedFormData;
-  }
+  // Cópia usada depois, ao anexar: o state.novo é limpo logo abaixo.
+  const formDataOriginal = { ...n.formData };
 
   state.requests.unshift(data);
   callEmailService("solicitacao_criada", {
@@ -1324,10 +1359,91 @@ async function criarSolicitacao(e){
     requester_nome: state.profile ? (state.profile.full_name || state.profile.email) : "",
     requester_email: state.profile ? state.profile.email : "",
   });
+  const arquivosPendentes = { ...n.files };
   state.novo = { typeId:"", target:"", title:"", priority:"media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee:"", formData:{}, files:{} };
   ok("Solicitação criada.");
   go("/solicitacao/"+data.id);
+  // Sobe os anexos depois de já mostrar o card, com aviso na tela.
+  enviarAnexosDaSolicitacao(data, anexoFields, arquivosPendentes, formDataOriginal);
   return false;
+}
+
+/**
+ * Envia os anexos de uma solicitação recém-criada. Roda depois que o card já
+ * está na tela, mostrando o progresso. Se algum falhar, avisa e o usuário pode
+ * anexar de novo pela própria tela de detalhes.
+ */
+/**
+ * Anexa (ou substitui) um arquivo direto pela tela de detalhes do card.
+ * Usado quando o envio falhou na criação, ou quando alguém precisa juntar um
+ * documento depois.
+ */
+async function anexarNoCard(e, requestId, fieldId){
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+  if(!anexoIsValid(file)){
+    err("Por segurança, arquivos executáveis não podem ser anexados.");
+    e.target.value = ""; return;
+  }
+  const r = state.detalhe.request || state.requests.find((x) => x.id === requestId);
+  if(!r) return;
+
+  state.uploading = { total:1, feito:0, nome:file.name };
+  render();
+  try{
+    const anexo = await enviarAnexo(file, pad4(r.code));
+    const merged = { ...(r.form_data || {}) };
+    merged[fieldId] = anexo;
+    const { error } = await sb.from("requests").update({ form_data: merged }).eq("id", requestId);
+    if(error) throw new Error(error.message);
+    r.form_data = merged;
+    const local = state.requests.find((x) => x.id === requestId);
+    if(local) local.form_data = merged;
+    state.uploading = null;
+    ok("Anexo enviado.");
+  } catch(err2){
+    state.uploading = null;
+    err("Não foi possível enviar o anexo: " + (err2.message || err2));
+  }
+  render();
+}
+
+async function enviarAnexosDaSolicitacao(request, anexoFields, arquivos, formDataOriginal){
+  const paraEnviar = anexoFields.filter((f) => arquivos[f.id]);
+  if(!paraEnviar.length) return;
+
+  state.uploading = { total: paraEnviar.length, feito: 0, nome: paraEnviar[0].label };
+  render();
+
+  const merged = { ...formDataOriginal };
+  const falhas = [];
+  for(const f of paraEnviar){
+    state.uploading.nome = f.label;
+    render();
+    try{
+      merged[f.id] = await enviarAnexo(arquivos[f.id], pad4(request.code));
+    } catch(e){
+      falhas.push(f.label + " (" + (e.message || e) + ")");
+    }
+    state.uploading.feito++;
+    render();
+  }
+  state.uploading = null;
+
+  await sb.from("requests").update({ form_data: merged }).eq("id", request.id);
+  request.form_data = merged;
+  const local = state.requests.find((r) => r.id === request.id);
+  if(local) local.form_data = merged;
+  if(state.detalhe.request && state.detalhe.request.id === request.id){
+    state.detalhe.request.form_data = merged;
+  }
+
+  if(falhas.length){
+    err("Não foi possível enviar: " + falhas.join(" | ") + ". Anexe novamente por esta tela.");
+  } else {
+    ok(paraEnviar.length > 1 ? "Anexos enviados." : "Anexo enviado.");
+  }
+  render();
 }
 
 /* ============================ Agenda ============================ */
@@ -1565,6 +1681,9 @@ function viewDetalhe(id){
   // O solicitante pode cancelar a própria solicitação enquanto ela não estiver
   // concluída ou já cancelada (mesmo sem poder mexer no resto do andamento).
   const podeCancelar = !podeEditar && souSolicitante && r.status !== "concluida" && r.status !== "cancelada";
+  // Anexar pela tela do card: responsável, master ou quem abriu, desde que a
+  // solicitação ainda esteja em andamento.
+  const podeAnexar = (podeEditar || souSolicitante) && r.status !== "concluida" && r.status !== "cancelada";
   const type = state.types.find((t) => t.id === r.request_type_id);
   const fields = parseFields(type && type.fields);
   const answers = r.form_data || {};
@@ -1579,8 +1698,14 @@ function viewDetalhe(id){
       '<dd class="mt-1 text-sm">'+(
         f.type === "anexo"
           ? (answers[f.id] && answers[f.id].url
-              ? '<a class="inline-flex items-center gap-1 text-primary underline" href="'+esc(answers[f.id].url)+'" target="_blank" rel="noopener">'+I.paperclip+' '+esc(answers[f.id].name||"Abrir anexo")+'</a>'
-              : "—")
+              ? '<a class="inline-flex items-center gap-1 text-primary underline" href="'+esc(answers[f.id].url)+'" target="_blank" rel="noopener">'+I.paperclip+' '+esc(answers[f.id].name||"Abrir anexo")+'</a>'+
+                (answers[f.id].size ? '<span class="ml-2 text-xs text-muted-foreground">'+formatarTamanho(answers[f.id].size)+'</span>' : "")+
+                (podeAnexar ? '<label class="ml-2 cursor-pointer text-xs text-muted-foreground underline">substituir'+
+                  '<input type="file" class="hidden" onchange="anexarNoCard(event,\''+r.id+'\',\''+f.id+'\')" /></label>' : "")
+              : (podeAnexar
+                  ? '<label class="inline-flex cursor-pointer items-center gap-1 text-primary underline">'+I.paperclip+' anexar arquivo'+
+                    '<input type="file" class="hidden" onchange="anexarNoCard(event,\''+r.id+'\',\''+f.id+'\')" /></label>'
+                  : "—"))
           : esc(answers[f.id] || "—")
       )+'</dd></div>').join("")+'</dl>' : "";
 
@@ -1809,6 +1934,9 @@ function viewConfiguracoes(){
   const gasUrl = state.settings.email_gas_url || "";
   const secret = state.settings.email_shared_secret || "";
   const configurado = !!(gasUrl && secret);
+  const anexosUrl = state.settings.anexos_gas_url || "";
+  const anexosSecret = state.settings.anexos_shared_secret || "";
+  const anexosConfigurado = !!(anexosUrl && anexosSecret);
   const statusRows = EMAIL_RULES.map((rule) => {
     const st = state.emailStatus && state.emailStatus[rule.key];
     const quando = st && st.lastRunAt ? formatDate(st.lastRunAt) + " " + new Date(st.lastRunAt).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "Nunca rodou";
@@ -1837,6 +1965,20 @@ function viewConfiguracoes(){
         '<button type="button" class="btn btn-primary" onclick="salvarConexaoEmail()">Salvar conexão</button>'+
         '<button type="button" class="btn btn-outline" onclick="testarConexaoEmail()">Testar conexão</button>'+
         (configurado ? '<span class="text-xs" style="color:var(--status-concluida)">Conectado</span>' : '<span class="text-xs text-muted-foreground">Ainda não configurado</span>')+
+      '</div>'+
+    '</section>'+
+
+    '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<h2 class="text-sm font-semibold">Anexos no SharePoint</h2>'+
+      '<p class="mt-1 text-xs text-muted-foreground">Serviço que envia os arquivos anexados nas solicitações para a biblioteca do SharePoint. É um Apps Script separado do de e-mails.</p>'+
+      '<div class="mt-4 grid gap-3 sm:grid-cols-2">'+
+        '<div><label class="lbl">URL do Web App</label><input class="inp" id="cfgAnexosUrl" placeholder="https://script.google.com/macros/s/.../exec" value="'+esc(anexosUrl)+'" /></div>'+
+        '<div><label class="lbl">Senha (SP_SHARED_SECRET)</label><input class="inp" id="cfgAnexosSecret" placeholder="a mesma senha do Apps Script de anexos" value="'+esc(anexosSecret)+'" /></div>'+
+      '</div>'+
+      '<div class="mt-4 flex items-center gap-3">'+
+        '<button type="button" class="btn btn-primary" onclick="salvarConexaoAnexos()">Salvar conexão</button>'+
+        '<button type="button" class="btn btn-outline" onclick="testarConexaoAnexos()">Testar conexão</button>'+
+        (anexosConfigurado ? '<span class="text-xs" style="color:var(--status-concluida)">Conectado</span>' : '<span class="text-xs text-muted-foreground">Ainda não configurado</span>')+
       '</div>'+
     '</section>'+
 
@@ -1871,6 +2013,21 @@ async function salvarConexaoEmail(){
   const { error: e2 } = await sb.from("app_settings").upsert({ key:"email_shared_secret", value:secret });
   if(e1 || e2){ err("Não foi possível salvar."); return; }
   await refreshSettings(); ok("Conexão salva."); render();
+}
+async function salvarConexaoAnexos(){
+  const url = document.getElementById("cfgAnexosUrl").value.trim();
+  const secret = document.getElementById("cfgAnexosSecret").value.trim();
+  if(!url || !secret) return err("Preencha a URL e a senha antes de salvar.");
+  const { error: e1 } = await sb.from("app_settings").upsert({ key:"anexos_gas_url", value:url });
+  const { error: e2 } = await sb.from("app_settings").upsert({ key:"anexos_shared_secret", value:secret });
+  if(e1 || e2){ err("Não foi possível salvar."); return; }
+  await refreshSettings(); ok("Conexão de anexos salva."); render();
+}
+async function testarConexaoAnexos(){
+  ok("Testando conexão com o SharePoint...");
+  const res = await callAnexoService("sp_ping", {});
+  if(res.ok) ok("Conectado! " + (res.mensagem || ""));
+  else err("Falha: " + (res.erro === "not_configured" ? "salve a URL e a senha primeiro." : res.erro));
 }
 async function testarConexaoEmail(){
   ok("Testando conexão...");
