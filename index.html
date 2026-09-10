@@ -768,6 +768,28 @@ async function callEmailService(action, payload){
     return { ok:false, error: e.message || String(e) };
   }
 }
+
+/**
+ * Dispara o e-mail de mudança de status enviando também os dados da
+ * solicitação (número, título, e-mail do solicitante). Assim o Apps Script não
+ * depende de conseguir ler o documento no banco para montar o e-mail — era
+ * essa leitura que falhava de vez em quando e fazia o aviso não chegar.
+ */
+function notificarStatus(request, novoStatus, extras){
+  if(!request) return;
+  const solicitante = state.profiles.find((p) => p.id === request.requester_id);
+  callEmailService("status_mudou", Object.assign({
+    id: request.id,
+    novoStatus: novoStatus,
+    code: request.code,
+    title: request.title,
+    requester_id: request.requester_id || null,
+    assignee_id: request.assignee_id || null,
+    request_type_id: request.request_type_id || null,
+    requester_nome: solicitante ? (solicitante.full_name || solicitante.email) : "",
+    requester_email: solicitante ? solicitante.email : "",
+  }, extras || {}));
+}
 async function refreshTasks(){
   if(!state.user) return;
   const { data } = await sb.from("personal_tasks").select("*").eq("user_id", state.user.id).order("task_date").order("task_time", { nullsFirst:true });
@@ -1144,7 +1166,7 @@ async function cancelarMinhaSolicitacao(id){
   invalidateArchiveCacheEntry_(local || Object.assign({}, r, patch));
   ok("Solicitação cancelada.");
   await loadDetalhe(id);
-  callEmailService("status_mudou", { id, novoStatus: "cancelada", canceladoPeloSolicitante: true });
+  notificarStatus(Object.assign({}, r, patch), "cancelada", { canceladoPeloSolicitante: true });
 }
 async function excluirSolicitacao(id){
   if(!confirm("Excluir esta solicitação definitivamente? Essa ação não pode ser desfeita.")) return;
@@ -1172,7 +1194,7 @@ async function moveStatus(id, status){
   if(r) Object.assign(r, patch);
   invalidateArchiveCacheEntry_(r);
   ok("Status atualizado."); render();
-  if(statusMudou && ["concluida","cancelada","cadastro_fiscal"].includes(status)) callEmailService("status_mudou", { id, novoStatus: status });
+  if(statusMudou && ["concluida","cancelada","cadastro_fiscal","aguardando"].includes(status)) notificarStatus(r, status);
 }
 
 /* ============================ Acompanhamento (minhas solicitações) ============================ */
@@ -1773,8 +1795,8 @@ async function atualizarSolicitacao(id, patch){
   invalidateArchiveCacheEntry_(antes);
   ok("Solicitação atualizada.");
   await loadDetalhe(id);
-  if(patch.status && antes && antes.status !== patch.status && ["concluida","cancelada","cadastro_fiscal"].includes(patch.status)){
-    callEmailService("status_mudou", { id, novoStatus: patch.status });
+  if(patch.status && antes && antes.status !== patch.status && ["concluida","cancelada","cadastro_fiscal","aguardando"].includes(patch.status)){
+    notificarStatus(antes, patch.status);
   }
   if("assignee_id" in patch && patch.assignee_id && antes && antes.assignee_id !== patch.assignee_id){
     callEmailService("responsavel_trocado", { id, novoResponsavelId: patch.assignee_id });
