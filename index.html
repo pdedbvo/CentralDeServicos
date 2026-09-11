@@ -1296,7 +1296,13 @@ function viewNova(){
       dyn+
       '<div class="grid gap-4 sm:grid-cols-3">'+
         '<div><label class="lbl">Prioridade</label><select class="inp" onchange="state.novo.priority=this.value">'+prioOpts+'</select></div>'+
-        '<div><label class="lbl">Prazo de finalização</label><input class="inp" type="date" value="'+esc(n.due)+'" onchange="state.novo.due=this.value" /></div>'+
+        (state.isMaster
+          ? '<div><label class="lbl">Prazo de finalização</label><input class="inp" type="date" value="'+esc(n.due)+'" onchange="state.novo.due=this.value" /></div>'
+          : '<div><label class="lbl">Prazo de finalização</label>'+
+            '<p class="inp flex items-center bg-surface text-muted-foreground">'+esc(n.due ? formatDate(n.due) : "Definido pelo tipo")+'</p>'+
+            '<p class="mt-1 text-xs text-muted-foreground">'+
+              (selectedType ? 'Prazo padrão deste tipo: '+selectedType.default_sla_days+' dia(s) útil(eis).' : 'Definido automaticamente pelo tipo.')+
+            '</p></div>')+
         (state.isMaster
           ? '<div><label class="lbl">Responsável <span class="text-destructive">*</span></label><select class="inp" onchange="state.novo.assignee=this.value">'+userOpts+'</select></div>'
           : '<div><label class="lbl">Responsável</label>'+
