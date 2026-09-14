@@ -485,7 +485,7 @@ const err = (m) => toast(m, "error");
 const MASTER_EMAILS = [
   "anaflavia.l@edificabpo.com.br",
   "sergio.f@edificabpo.com.br",
-  "jaquelline.a@edificabpo.com.br",
+  "jacqueline.p@edificabpo.com.br",
 ];
 /* ============================ Tema (claro / escuro) ============================
    A escolha fica salva no navegador de cada pessoa. Na primeira visita segue a
@@ -552,6 +552,7 @@ const state = {
   novo: { typeId: "", target: "", title: "", priority: "media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee: "", formData: {}, files: {} },
   tipos: { editingId: null, name: "", description: "", departmentId: "", ownerId: "", sla: DEFAULT_SLA_BUSINESS_DAYS, tag: "", fields: [], needsFiscal: false, fiscalAssigneeId: "" },
   pessoa: { editingId: null, name: "", email: "", active: true },
+  pessoaBusca: "", pessoaVerTodas: false,
   departamento: { name: "" },
   detalhe: { request: null, comments: [], comment: "", loading: false },
   uploading: null, // { total, feito, nome } enquanto anexos sobem para o SharePoint
@@ -563,11 +564,20 @@ async function loadCore(){
   // 1) Descobrir o nível ANTES de buscar solicitações, para buscar só o que
   //    esta pessoa realmente pode ver (menos leituras no banco).
   if(state.user){
-    const roles = await sb.from("user_roles").select("role").eq("user_id", state.user.id);
-    const meusPapeis = (roles.data || []).map((r) => r.role);
-    const nivelSalvo = meusPapeis.find((r) => ACCESS_LEVELS.some((l) => l.value === r));
-    state.isMaster = meusPapeis.includes("master") || isHardcodedMaster(state.user.email);
+    // Lê o papel buscando cada documento pelo id (uid_nivel) em vez de fazer
+    // uma consulta. Consulta depende de a regra do Firestore permitir "list";
+    // leitura por id funciona mesmo com regras mais restritivas — e era isso
+    // que fazia alguém com nível definido entrar como "solicitante".
+    let nivelSalvo = null;
+    let leituraFalhou = false;
+    for(const l of ACCESS_LEVELS){
+      const { data, error } = await sb.from("user_roles").select("*").eq("id", state.user.id + "_" + l.value).maybeSingle();
+      if(error) leituraFalhou = true;
+      if(data) { nivelSalvo = l.value; if(l.value === "master") break; }
+    }
+    state.isMaster = nivelSalvo === "master" || isHardcodedMaster(state.user.email);
     state.accessLevel = state.isMaster ? "master" : (nivelSalvo || "solicitante");
+    state.nivelLeituraFalhou = leituraFalhou && !nivelSalvo;
   }
 
   // 2) Solicitações ativas: master vê todas; os demais recebem só as suas
@@ -2088,12 +2098,37 @@ function viewPessoas(){
   const p = state.pessoa;
   const dp = state.departamento;
 
-  const lista = state.pessoas.length ? state.pessoas.map((pe) => '<div class="flex items-center gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card">'+
-      '<div class="min-w-0 flex-1"><p class="text-sm font-semibold">'+esc(pe.full_name)+'</p>'+
-      '<p class="text-xs text-muted-foreground">'+esc(pe.email)+'</p></div>'+
-      '<button type="button" class="switch" data-on="'+(pe.active?1:0)+'" title="'+(pe.active?"Ativo":"Inativo")+'" onclick="togglePessoa(\''+pe.id+'\','+(!pe.active)+')"></button>'+
-      '<button type="button" class="btn btn-ghost btn-sm" onclick="editarPessoa(\''+pe.id+'\')">Editar</button>'+
-    '</div>').join("")
+  // Busca por nome ou e-mail — a lista cresceu e rolar até achar ficou inviável.
+  const busca = (state.pessoaBusca || "").trim().toLowerCase();
+  const filtradas = busca
+    ? state.pessoas.filter((pe) => (pe.full_name||"").toLowerCase().includes(busca) || (pe.email||"").toLowerCase().includes(busca))
+    : state.pessoas;
+  const LIMITE_PESSOAS = 25;
+  const verTodas = !!state.pessoaVerTodas || !!busca;
+  const visiveis = verTodas ? filtradas : filtradas.slice(0, LIMITE_PESSOAS);
+  const ocultas = filtradas.length - visiveis.length;
+
+  const barraBusca = '<div class="mb-3 flex flex-wrap items-center gap-2">'+
+    '<div class="relative flex-1 min-w-[14rem]">'+
+      '<span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
+      '<input id="pessoaBuscaInput" class="inp pl-8" placeholder="Buscar por nome ou e-mail" value="'+esc(state.pessoaBusca||"")+'" oninput="debouncedPessoaBusca(this.value)" />'+
+    '</div>'+
+    '<span class="text-xs text-muted-foreground">'+filtradas.length+' de '+state.pessoas.length+'</span>'+
+  '</div>';
+
+  const lista = state.pessoas.length
+    ? barraBusca + (filtradas.length
+        ? visiveis.map((pe) => '<div class="flex items-center gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card'+(state.pessoa.editingId===pe.id?" ring-2 ring-ring":"")+'">'+
+            '<div class="min-w-0 flex-1"><p class="truncate text-sm font-semibold">'+esc(pe.full_name)+'</p>'+
+            '<p class="truncate text-xs text-muted-foreground">'+esc(pe.email)+'</p></div>'+
+            '<button type="button" class="switch" data-on="'+(pe.active?1:0)+'" title="'+(pe.active?"Pode criar acesso":"Bloqueado")+'" onclick="togglePessoa(\''+pe.id+'\','+(!pe.active)+')"></button>'+
+            '<button type="button" class="btn btn-ghost btn-sm" onclick="editarPessoa(\''+pe.id+'\')">Editar</button>'+
+            '<button type="button" title="Excluir cadastro" onclick="excluirPessoa(\''+pe.id+'\')" class="text-muted-foreground hover:text-destructive">'+I.trash+'</button>'+
+          '</div>').join("")+
+          (ocultas > 0
+            ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2.5 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.pessoaVerTodas=true;render()">Mostrar todas as '+filtradas.length+' (+'+ocultas+')</button>'
+            : "")
+        : '<p class="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">Ninguém encontrado com esse termo.</p>')
     : '<p class="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">Nenhuma pessoa cadastrada ainda.</p>';
 
   const listaDeps = state.departments.length ? state.departments.map((d) => '<div class="flex items-center gap-3 rounded-lg border border-border bg-card p-3 shadow-card">'+
@@ -2105,7 +2140,7 @@ function viewPessoas(){
   return '<div class="mx-auto max-w-4xl"><h1 class="text-3xl font-bold">Cadastro de pessoas</h1>'+
     '<p class="mt-1 text-sm text-muted-foreground">Cadastre o e-mail de cada colaborador aqui antes que ele possa criar acesso na página inicial.</p>'+
     '<div class="mt-8 grid gap-6 lg:grid-cols-2">'+
-      '<form onsubmit="return salvarPessoa(event)" class="space-y-4 rounded-xl border border-border bg-card p-6 shadow-card h-fit">'+
+      '<form id="formPessoa" onsubmit="return salvarPessoa(event)" class="space-y-4 rounded-xl border border-border bg-card p-6 shadow-card h-fit'+(p.editingId?" ring-2 ring-ring":"")+'">'+
         '<h2 class="text-sm font-semibold">'+(p.editingId?"Editar pessoa":"Nova pessoa")+'</h2>'+
         '<div><label class="lbl">Nome completo</label><input class="inp" maxlength="120" value="'+esc(p.name)+'" oninput="state.pessoa.name=this.value" /></div>'+
         '<div><label class="lbl">E-mail</label><input class="inp" type="email" value="'+esc(p.email)+'" oninput="state.pessoa.email=this.value" /></div>'+
@@ -2167,10 +2202,38 @@ function viewPessoas(){
     '</section>'+
   '</div>';
 }
+let __pessoaBuscaTimer = null;
+function debouncedPessoaBusca(valor){
+  state.pessoaBusca = valor;
+  state.pessoaVerTodas = false;
+  clearTimeout(__pessoaBuscaTimer);
+  __pessoaBuscaTimer = setTimeout(render, 300);
+}
 function editarPessoa(id){
   const pe = state.pessoas.find((x) => x.id === id);
   if(!pe) return;
   state.pessoa = { editingId: pe.id, name: pe.full_name, email: pe.email, active: pe.active };
+  render();
+  // A lista é longa: leva a pessoa até o formulário, senão parece que o botão
+  // não fez nada (o formulário fica no topo da página).
+  setTimeout(() => {
+    const form = document.getElementById("formPessoa");
+    if(form) form.scrollIntoView({ behavior:"smooth", block:"center" });
+    const campo = document.querySelector('input[oninput*="state.pessoa.name"]');
+    if(campo) campo.focus();
+  }, 50);
+}
+async function excluirPessoa(id){
+  const pe = state.pessoas.find((x) => x.id === id);
+  if(!pe) return;
+  if(!confirm('Excluir o cadastro de "'+pe.full_name+'" ('+pe.email+')?\n\n' +
+    'A pessoa deixa de poder criar acesso. Se ela já tem acesso criado, ele continua funcionando — ' +
+    'para bloquear alguém que já entra, use o interruptor em vez de excluir.')) return;
+  const { error } = await sb.from("pessoas_cadastradas").delete().eq("id", id);
+  if(error){ err("Não foi possível excluir: "+error.message); return; }
+  if(state.pessoa.editingId === id) state.pessoa = { editingId:null, name:"", email:"", active:true };
+  await refreshPessoas();
+  ok("Cadastro excluído.");
   render();
 }
 function cancelarEdicaoPessoa(){ state.pessoa = { editingId: null, name: "", email: "", active: true }; render(); }
