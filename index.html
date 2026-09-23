@@ -547,7 +547,7 @@ const state = {
     painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
     relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos",
   },
-  agenda: { showForm: false, showDone: false, viewUserId: "" },
+  agenda: { showForm: false, showDone: false, viewUserId: "", editTask: null },
   painelExpanded: {},
   novo: { typeId: "", target: "", title: "", priority: "media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee: "", formData: {}, files: {} },
   tipos: { editingId: null, name: "", description: "", departmentId: "", ownerId: "", sla: DEFAULT_SLA_BUSINESS_DAYS, tag: "", fields: [], needsFiscal: false, fiscalAssigneeId: "" },
@@ -635,8 +635,7 @@ async function loadCore(){
     }
   }
   if(state.user){
-    const tasks = await sb.from("personal_tasks").select("*").eq("user_id", state.user.id).order("task_date").order("task_time", { nullsFirst:true });
-    state.tasks = tasks.data || [];
+    await refreshTasks();
     await refreshRoles();
     if(state.isMaster) await refreshEmailStatus();
   }
@@ -652,7 +651,7 @@ async function loadCore(){
 //  - "completo": TODO o histórico. Só é buscado quando alguém realmente pede
 //    um período maior (ex: "Todo o período" nos Relatórios ou no Quadro).
 const ARCHIVE_RECENT_DAYS = 120;
-const ARCHIVE_CACHE_KEY = "dbvohub_archive_recent_cache_v2";
+const ARCHIVE_CACHE_KEY = "dbvohub_archive_recent_cache_v3"; // v3: descarta caches vazios gravados pela consulta antiga
 const ARCHIVE_FULL_CACHE_KEY = "dbvohub_archive_full_cache_v2";
 const ARCHIVE_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 horas
 function readCache_(key){
@@ -678,11 +677,20 @@ async function ensureArchiveLoaded(){
   if(!arquivo){
     const cutoff = new Date(Date.now() - ARCHIVE_RECENT_DAYS*86400000).toISOString();
     if(state.isMaster){
-      const [concluidas, canceladas] = await Promise.all([
-        sb.from("requests").select("*").eq("status","concluida").gte("completed_at", cutoff),
-        sb.from("requests").select("*").eq("status","cancelada").gte("completed_at", cutoff),
-      ]);
-      arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
+      // Uma consulta só pela data de conclusão (campo único, não exige índice
+      // composto). Antes era status == X + completed_at >= Y: essa combinação
+      // exige índice composto no Firestore e, sem ele, voltava vazia em
+      // silêncio (e o vazio ainda ficava 6h no cache).
+      const { data, error } = await sb.from("requests").select("*").gte("completed_at", cutoff);
+      if(error){
+        console.error("[arquivo] falha ao ler concluídas recentes:", error.message);
+        // Marca como carregado para NÃO ficar tentando de novo a cada tela
+        // (isso estouraria a cota), mas não grava cache: no próximo login tenta.
+        state.requestsArchiveLoaded = true;
+        state.requestsArchiveLoading = false;
+        return;
+      }
+      arquivo = (data||[]).filter((r) => r.status === "concluida" || r.status === "cancelada");
     } else {
       // Quem não é master só precisa do próprio histórico: busca por pessoa
       // (bem menos leituras) e filtra os arquivados aqui.
@@ -705,8 +713,8 @@ async function ensureArchiveLoaded(){
 // explicitamente um período maior que os últimos ARCHIVE_RECENT_DAYS dias.
 async function ensureFullArchiveLoaded(){
   if(state.requestsFullArchiveLoaded || state.requestsFullArchiveLoading) return;
+  state.requestsFullArchiveLoading = true; // marca antes de qualquer espera
   await ensureArchiveLoaded(); // garante que a camada recente já está mesclada
-  state.requestsFullArchiveLoading = true;
   let arquivo = readCache_(ARCHIVE_FULL_CACHE_KEY);
   if(!arquivo){
     if(state.isMaster){
@@ -800,16 +808,40 @@ function notificarStatus(request, novoStatus, extras){
     requester_email: solicitante ? solicitante.email : "",
   }, extras || {}));
 }
+// Atividades avulsas (coleção personal_tasks). Ficam SÓ na agenda: não são
+// solicitações e nunca entram no Quadro, Acompanhamento ou Relatórios.
+//
+// Sem .order() nas consultas de propósito: filtro por user_id + ordenação
+// exigiriam um índice composto no Firestore; sem ele a consulta falha em
+// silêncio e volta vazia (a atividade era gravada, mas "sumia" na releitura).
+// A ordenação é feita aqui no código.
+function ordenarTarefas(lista){
+  return (lista || []).slice().sort((a,b) =>
+    String(a.task_date||"").localeCompare(String(b.task_date||"")) ||
+    String(a.task_time||"").localeCompare(String(b.task_time||"")) ||
+    String(a.created_at||"").localeCompare(String(b.created_at||"")));
+}
+async function buscarTarefasDe(userId){
+  const { data, error } = await sb.from("personal_tasks").select("*").eq("user_id", userId);
+  if(error) console.error("[agenda] falha ao ler atividades de "+userId+":", error.message);
+  return { tasks: ordenarTarefas(data), error };
+}
 async function refreshTasks(){
   if(!state.user) return;
-  const { data } = await sb.from("personal_tasks").select("*").eq("user_id", state.user.id).order("task_date").order("task_time", { nullsFirst:true });
-  state.tasks = data || [];
+  const { tasks, error } = await buscarTarefasDe(state.user.id);
+  if(error){ err("Não foi possível carregar suas atividades da agenda."); return; } // mantém a lista anterior
+  state.tasks = tasks;
 }
-const agendaOtherCache = { userId: "", tasks: [] };
+const agendaOtherCache = { userId: "", tasks: [], loadingFor: "" };
 async function loadAgendaFor(userId){
-  if(!userId){ agendaOtherCache.userId = ""; agendaOtherCache.tasks = []; render(); return; }
-  const { data } = await sb.from("personal_tasks").select("*").eq("user_id", userId).order("task_date").order("task_time", { nullsFirst:true });
-  agendaOtherCache.userId = userId; agendaOtherCache.tasks = data || [];
+  if(!userId){ agendaOtherCache.userId = ""; agendaOtherCache.tasks = []; agendaOtherCache.loadingFor = ""; render(); return; }
+  if(agendaOtherCache.loadingFor === userId) return; // já está buscando: evita leituras repetidas a cada render
+  agendaOtherCache.loadingFor = userId;
+  const { tasks, error } = await buscarTarefasDe(userId);
+  if(agendaOtherCache.loadingFor !== userId) return; // trocou de pessoa no meio da busca
+  agendaOtherCache.loadingFor = "";
+  if(error) err("Não foi possível carregar as atividades avulsas dessa pessoa.");
+  agendaOtherCache.userId = userId; agendaOtherCache.tasks = tasks;
   render();
 }
 async function refreshTypes(){
@@ -822,7 +854,7 @@ const depById = (id) => { const d = state.departments.find((x) => x.id === id); 
 /* ============================ Router ============================ */
 function route(){ return (location.hash || "#/").slice(1); }
 function go(path){ location.hash = path; }
-window.addEventListener("hashchange", render);
+window.addEventListener("hashchange", () => { if(state.agenda) state.agenda.editTask = null; render(); });
 
 const PROTECTED = ["/painel","/nova","/agenda","/relatorios","/tipos","/solicitacao","/acompanhamento","/pessoas","/configuracoes"];
 
@@ -850,12 +882,16 @@ async function render(){
 
   let inner = "";
   const NEEDS_ARCHIVE = ["/painel","/acompanhamento","/relatorios","/agenda"];
-  if(NEEDS_ARCHIVE.some((p) => path.startsWith(p)) && !state.requestsArchiveLoaded){
+  // Só dispara (e só agenda o render de volta) quando NÃO há carga em curso.
+  // Antes, qualquer render durante o carregamento chamava a função de novo,
+  // que voltava na hora e disparava outro render, em ciclo infinito: a tela
+  // travava e nada respondia a clique.
+  if(NEEDS_ARCHIVE.some((p) => path.startsWith(p)) && !state.requestsArchiveLoaded && !state.requestsArchiveLoading){
     ensureArchiveLoaded().then(render);
   }
   // Períodos maiores que a janela "recente" (120 dias) precisam do histórico completo.
   const periodoAmplo = (v) => v === "todos" || Number(v) > ARCHIVE_RECENT_DAYS;
-  if(!state.requestsFullArchiveLoaded && (
+  if(!state.requestsFullArchiveLoaded && !state.requestsFullArchiveLoading && (
     (path.startsWith("/painel") && periodoAmplo(state.filters.painelPeriod)) ||
     (path.startsWith("/relatorios") && periodoAmplo(state.filters.relPeriod)) ||
     path.startsWith("/acompanhamento")
@@ -1501,13 +1537,13 @@ function nextRepeatDate(dateStr, interval){
   else return null;
   return d.toISOString().slice(0,10);
 }
-function dayLabel(date){
+function dayLabel(date, tudoConcluido){
   if(date === NO_DATE) return "Sem data definida";
   const diff = daysUntil(date);
   const base = new Date(date+"T12:00:00").toLocaleDateString("pt-BR", { weekday:"long", day:"2-digit", month:"long" });
   if(diff === 0) return "Hoje · "+base;
   if(diff === 1) return "Amanhã · "+base;
-  if(diff !== null && diff < 0) return "Atrasado · "+base;
+  if(diff !== null && diff < 0) return (tudoConcluido ? "" : "Atrasado · ")+base;
   return base;
 }
 const agendaForm = { title:"", description:"", date: todayISO(), time:"", priority:"media", repeat:"none" };
@@ -1530,14 +1566,17 @@ function viewAgenda(){
   const myTasks = targetTasks.filter((t) => a.showDone || !t.is_done);
   let items = [
     ...myRequests.map((r) => {
-      const original = r.due_date || NO_DATE;
-      const overdue = original !== NO_DATE && r.status !== "concluida" && r.status !== "cancelada" && daysUntil(original) < 0;
-      return { kind:"request", originalDate: original, date: overdue ? today : original, overdue, request: r };
+      const fechada = r.status === "concluida" || r.status === "cancelada";
+      // Concluída/cancelada sem prazo: posiciona pela data de conclusão, para
+      // aparecer em "Mostrar concluídas" em vez de ir para "Sem data".
+      const original = r.due_date || (fechada && r.completed_at ? String(r.completed_at).slice(0,10) : NO_DATE);
+      const overdue = original !== NO_DATE && !fechada && daysUntil(original) < 0;
+      return { kind:"request", originalDate: original, date: overdue ? today : original, overdue, done: fechada, request: r };
     }),
     ...myTasks.map((t) => {
-      const original = t.task_date;
-      const overdue = !t.is_done && original && daysUntil(original) < 0;
-      return { kind:"task", originalDate: original, date: overdue ? today : original, overdue, task: t };
+      const original = t.task_date || NO_DATE;
+      const overdue = !t.is_done && original !== NO_DATE && daysUntil(original) < 0;
+      return { kind:"task", originalDate: original, date: overdue ? today : original, overdue, done: !!t.is_done, task: t };
     }),
   ];
   const range = state.filters.agendaRange;
@@ -1550,7 +1589,7 @@ function viewAgenda(){
   const map = new Map();
   upcomingItems.forEach((it) => { const l = map.get(it.date) || []; l.push(it); map.set(it.date, l); });
   const groups = [...map.entries()].sort((x,y) => x[0].localeCompare(y[0]));
-  const pending = myRequests.length + myTasks.filter((t) => !t.is_done).length;
+  const pending = myRequests.filter((r) => r.status !== "concluida" && r.status !== "cancelada").length + myTasks.filter((t) => !t.is_done).length;
   const prioOpts = Object.entries(PRIORITY_LABEL).map(([v,l]) => '<option value="'+v+'"'+(v===agendaForm.priority?" selected":"")+'>'+l+'</option>').join("");
   const rangeOpts = AGENDA_RANGES.map((rg) => '<option value="'+rg.value+'"'+(rg.value===range?" selected":"")+'>'+rg.label+'</option>').join("");
   const repeatOpts = REPEAT_OPTIONS.map((rp) => '<option value="'+rp.value+'"'+(rp.value===agendaForm.repeat?" selected":"")+'>'+rp.label+'</option>').join("");
@@ -1581,7 +1620,9 @@ function viewAgenda(){
       (hiddenToday > 0 ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded.__agendaHoje=true;render()">Mostrar todos os '+todayItems.length+' (+'+hiddenToday+')</button>' : "")+
     '</ul>' : todoEmpty;
 
-  const empty = groups.length === 0 ? "" : "";
+  const carregandoOutro = viewingOther && agendaOtherCache.userId !== a.viewUserId;
+  const empty = carregandoOutro ? '<p class="py-6 text-center text-sm text-muted-foreground">Carregando atividades avulsas…</p>'
+    : (groups.length === 0 && todayItems.length === 0 ? '<p class="py-6 text-center text-sm text-muted-foreground">'+(a.showDone ? "Nenhuma atividade encontrada." : "Nenhuma atividade pendente. Use “Mostrar concluídas” para ver o histórico.")+'</p>' : "");
   const body = groups.map(([groupDate, list]) => {
     const key = "__agendaGroup_"+groupDate;
     const groupExpanded = !!state.painelExpanded[key];
@@ -1589,7 +1630,7 @@ function viewAgenda(){
     const hiddenList = list.length - visibleList.length;
     return '<section>'+
     '<header class="flex items-baseline gap-3 border-b border-border pb-2">'+
-      '<h2 class="font-display text-sm font-semibold capitalize">'+dayLabel(groupDate)+'</h2>'+
+      '<h2 class="font-display text-sm font-semibold capitalize">'+dayLabel(groupDate, list.every((it) => it.done))+'</h2>'+
       '<span class="text-xs text-muted-foreground">'+list.length+' itens</span></header>'+
     '<ul class="mt-3 space-y-2">'+visibleList.map((item) => item.kind === "request" ? agendaRequestItem(item.request, item.overdue) : agendaTaskItem(item.task, item.overdue, viewingOther)).join("")+
       (hiddenList > 0 ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded[\''+key+'\']=true;render()">Mostrar todos os '+list.length+' (+'+hiddenList+')</button>' : "")+
@@ -1602,7 +1643,7 @@ function viewAgenda(){
       '<div><h1 class="text-3xl font-bold">'+(viewingOther ? "Agenda de "+esc(nameById(a.viewUserId)) : "Minha agenda")+'</h1>'+
       '<p class="mt-1 text-sm text-muted-foreground">'+pending+' atividades sob responsabilidade'+(viewingOther?" dessa pessoa":"")+'. Atrasadas aparecem em Hoje.</p></div>'+
       '<div class="flex flex-wrap items-center gap-2">'+
-        (state.isMaster ? '<select class="inp w-56" onchange="state.agenda.viewUserId=this.value;loadAgendaFor(this.value)">'+userOpts+'</select>' : "")+
+        (state.isMaster ? '<select class="inp w-56" onchange="state.agenda.editTask=null;state.agenda.viewUserId=this.value;loadAgendaFor(this.value)">'+userOpts+'</select>' : "")+
         '<select class="inp w-44" onchange="state.filters.agendaRange=this.value;render()">'+rangeOpts+'</select>'+
         '<button class="btn btn-outline btn-sm" onclick="state.agenda.showDone=!state.agenda.showDone;render()">'+(a.showDone?"Ocultar concluídas":"Mostrar concluídas")+'</button>'+
         (viewingOther ? "" : '<button class="btn btn-primary btn-sm" onclick="state.agenda.showForm=!state.agenda.showForm;render()">'+I.plus+' Atividade avulsa</button>')+
@@ -1613,8 +1654,95 @@ function viewAgenda(){
       '<span class="text-xs text-muted-foreground">'+todayItems.length+' itens</span></header>'+
       '<div class="mt-4">'+todoList+'</div>'+
     '</section>'+
-    '<div class="mt-8 space-y-8">'+empty+body+'</div></div>';
+    '<div class="mt-8 space-y-8">'+empty+body+'</div>'+
+    modalTarefa()+'</div>';
 }
+/* ---------- Card da atividade avulsa (abrir, editar e salvar) ---------- */
+function tarefaPorId(id){
+  return state.tasks.find((t) => t.id === id) || agendaOtherCache.tasks.find((t) => t.id === id) || null;
+}
+function abrirTarefa(id){
+  const t = tarefaPorId(id);
+  if(!t) return err("Atividade não encontrada. Recarregue a página.");
+  state.agenda.editTask = {
+    id: t.id, user_id: t.user_id, title: t.title || "", description: t.description || "",
+    date: t.task_date || todayISO(), time: t.task_time ? String(t.task_time).slice(0,5) : "",
+    priority: t.priority || "media", repeat: t.repeat_interval || "none", is_done: !!t.is_done,
+    created_at: t.created_at || "",
+    // Só quem é dono da atividade edita; o master vendo a agenda de outra pessoa só consulta.
+    readOnly: t.user_id !== state.user.id,
+    saving: false,
+  };
+  render();
+  setTimeout(() => { const el = document.getElementById("tarefa-titulo"); if(el && !state.agenda.editTask.readOnly) el.focus(); }, 0);
+}
+function fecharTarefa(){ state.agenda.editTask = null; render(); }
+function modalTarefa(){
+  const e = state.agenda.editTask;
+  if(!e) return "";
+  const ro = e.readOnly, dis = ro ? " disabled" : "";
+  const prio = Object.entries(PRIORITY_LABEL).map(([v,l]) => '<option value="'+v+'"'+(v===e.priority?" selected":"")+'>'+l+'</option>').join("");
+  const rep = REPEAT_OPTIONS.map((r) => '<option value="'+r.value+'"'+(r.value===e.repeat?" selected":"")+'>'+r.label+'</option>').join("");
+  const set = (campo) => 'state.agenda.editTask.'+campo+'=this.value';
+  return '<div class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 p-4 sm:p-8" onclick="if(event.target===this)fecharTarefa()">'+
+    '<form onsubmit="return salvarTarefa(event)" role="dialog" aria-modal="true" aria-label="Atividade avulsa" class="relative mt-8 w-full max-w-2xl space-y-4 rounded-xl border border-border bg-card p-6 shadow-card">'+
+      '<div class="flex items-start justify-between gap-4">'+
+        '<div><p class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Atividade avulsa'+(ro ? " · "+esc(nameById(e.user_id))+" · somente leitura" : "")+'</p>'+
+        '<p class="mt-1 text-xs text-muted-foreground">'+(e.is_done ? "Concluída" : "Pendente")+(e.created_at ? " · criada em "+formatDate(String(e.created_at).slice(0,10)) : "")+'</p></div>'+
+        '<button type="button" aria-label="Fechar" onclick="fecharTarefa()" class="rounded px-2 text-xl leading-none text-muted-foreground hover:text-foreground">×</button>'+
+      '</div>'+
+      '<div><label class="lbl" for="tarefa-titulo">Atividade</label><input id="tarefa-titulo" class="inp" maxlength="140" value="'+esc(e.title)+'" oninput="'+set("title")+'"'+dis+' /></div>'+
+      '<div><label class="lbl">Observações</label><textarea class="inp" rows="5" maxlength="1000" oninput="'+set("description")+'"'+dis+'>'+esc(e.description)+'</textarea></div>'+
+      '<div class="grid gap-4 sm:grid-cols-4">'+
+        '<div><label class="lbl">Data</label><input class="inp" type="date" value="'+e.date+'" onchange="'+set("date")+'"'+dis+' /></div>'+
+        '<div><label class="lbl">Horário (opcional)</label><input class="inp" type="time" value="'+e.time+'" onchange="'+set("time")+'"'+dis+' /></div>'+
+        '<div><label class="lbl">Prioridade</label><select class="inp" onchange="'+set("priority")+'"'+dis+'>'+prio+'</select></div>'+
+        '<div><label class="lbl">Repetir após concluir</label><select class="inp" onchange="'+set("repeat")+'"'+dis+'>'+rep+'</select></div>'+
+      '</div>'+
+      '<div class="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-4">'+
+        (ro ? '<span></span>' :
+          '<div class="flex gap-2">'+
+            '<button type="button" class="btn btn-ghost btn-sm text-destructive" onclick="excluirTarefaDoCard()">'+I.trash+' Excluir</button>'+
+            '<button type="button" class="btn btn-outline btn-sm" onclick="concluirTarefaDoCard()">'+(e.is_done ? I.undo+" Reabrir" : I.check+" Concluir")+'</button>'+
+          '</div>')+
+        '<div class="flex gap-2">'+
+          '<button type="button" class="btn btn-ghost" onclick="fecharTarefa()">'+(ro ? "Fechar" : "Cancelar")+'</button>'+
+          (ro ? "" : '<button type="submit" class="btn btn-primary"'+(e.saving?" disabled":"")+'>'+(e.saving ? "Salvando…" : "Salvar")+'</button>')+
+        '</div>'+
+      '</div>'+
+    '</form></div>';
+}
+async function salvarTarefa(ev){
+  if(ev) ev.preventDefault();
+  const e = state.agenda.editTask;
+  if(!e || e.readOnly || e.saving) return false;
+  if(e.title.trim().length < 3){ err("Descreva a atividade em um título."); return false; }
+  if(!e.date){ err("Informe a data da atividade."); return false; }
+  e.saving = true; render();
+  const { error } = await sb.from("personal_tasks").update({
+    title: e.title.trim(), description: e.description.trim(), task_date: e.date,
+    task_time: e.time || null, priority: e.priority || "media", repeat_interval: e.repeat || "none",
+  }).eq("id", e.id);
+  if(error){
+    console.error("[agenda] falha ao editar:", error.message);
+    e.saving = false; render(); err("Não foi possível salvar as alterações."); return false;
+  }
+  state.agenda.editTask = null;
+  await refreshTasks(); ok("Atividade atualizada."); render();
+  return false;
+}
+async function concluirTarefaDoCard(){
+  const e = state.agenda.editTask; if(!e || e.readOnly) return;
+  state.agenda.editTask = null;
+  await toggleTarefa(e.id, !e.is_done);
+}
+async function excluirTarefaDoCard(){
+  const e = state.agenda.editTask; if(!e || e.readOnly) return;
+  if(!confirm("Excluir esta atividade da agenda? Essa ação não pode ser desfeita.")) return;
+  state.agenda.editTask = null;
+  await removerTarefa(e.id);
+}
+document.addEventListener("keydown", (ev) => { if(ev.key === "Escape" && state.agenda && state.agenda.editTask) fecharTarefa(); });
 function overdueBadge(overdue){
   return overdue ? '<span class="rounded-full bg-destructive/15 px-2 py-0.5 text-[11px] font-medium text-destructive">Atrasada</span>' : "";
 }
@@ -1629,7 +1757,7 @@ function agendaRequestItem(r, overdue){
 function agendaTaskItem(t, overdue, readOnly){
   return '<li class="flex items-start gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card">'+
     '<button type="button" '+(readOnly?"disabled":'')+' aria-label="'+(t.is_done?"Reabrir atividade":"Concluir atividade")+'" onclick="toggleTarefa(\''+t.id+'\','+(!t.is_done)+')" class="mt-0.5 grid size-5 shrink-0 place-items-center rounded border border-input text-muted-foreground hover:text-foreground disabled:opacity-50">'+(t.is_done?I.undo:I.check)+'</button>'+
-    '<div class="min-w-0 flex-1"><p class="font-display text-sm font-semibold '+(t.is_done?"text-muted-foreground line-through":"")+'">'+esc(t.title)+'</p>'+
+    '<div class="min-w-0 flex-1"><button type="button" onclick="abrirTarefa(\''+t.id+'\')" class="text-left font-display text-sm font-semibold hover:underline '+(t.is_done?"text-muted-foreground line-through":"")+'">'+esc(t.title)+'</button>'+
     '<p class="mt-1 text-xs text-muted-foreground">Atividade pessoal'+(t.task_time?" · "+t.task_time.slice(0,5):"")+' · '+formatDate(t.task_date)+
       (t.repeat_interval && t.repeat_interval !== "none" ? " · Repete "+REPEAT_LABEL[t.repeat_interval].toLowerCase() : "")+'</p>'+
     (t.description ? '<p class="mt-1 text-xs text-muted-foreground">'+esc(t.description)+'</p>' : "")+'</div>'+
@@ -1640,7 +1768,7 @@ function agendaTaskItem(t, overdue, readOnly){
 function agendaTodoItem(t, overdue, readOnly){
   return '<li class="flex items-center gap-3 rounded-lg border border-border p-3 '+(t.is_done?"bg-surface":"bg-card shadow-card")+'">'+
     '<button type="button" '+(readOnly?"disabled":"")+' aria-label="'+(t.is_done?"Reabrir atividade":"Concluir atividade")+'" onclick="toggleTarefa(\''+t.id+'\','+(!t.is_done)+')" class="grid size-6 shrink-0 place-items-center rounded-full border-2 border-input text-muted-foreground hover:border-primary hover:text-primary disabled:opacity-50">'+(t.is_done?I.undo:I.check)+'</button>'+
-    '<span class="min-w-0 flex-1 text-sm font-medium '+(t.is_done?"text-muted-foreground line-through":"")+'">'+esc(t.title)+(t.task_time?' <span class="text-xs text-muted-foreground">· '+t.task_time.slice(0,5)+'</span>':"")+'</span>'+
+    '<button type="button" onclick="abrirTarefa(\''+t.id+'\')" class="min-w-0 flex-1 text-left text-sm font-medium hover:underline '+(t.is_done?"text-muted-foreground line-through":"")+'">'+esc(t.title)+(t.task_time?' <span class="text-xs text-muted-foreground">· '+t.task_time.slice(0,5)+'</span>':"")+'</button>'+
     overdueBadge(overdue)+
     '<span class="rounded-full px-2 py-0.5 text-[11px] font-medium '+PRIORITY_CLASS[t.priority]+'">'+PRIORITY_LABEL[t.priority]+'</span>'+
   '</li>';
@@ -1650,11 +1778,11 @@ async function criarTarefa(e){
   if(agendaForm.title.trim().length < 3) return err("Descreva a atividade em um título."), false;
   const { error } = await sb.from("personal_tasks").insert({
     user_id: state.user.id, title: agendaForm.title.trim(), description: agendaForm.description.trim(),
-    task_date: agendaForm.date, task_time: agendaForm.time || null, priority: agendaForm.priority,
+    task_date: agendaForm.date || todayISO(), task_time: agendaForm.time || null, priority: agendaForm.priority || "media",
     repeat_interval: agendaForm.repeat || "none", is_done: false,
   });
-  if(error){ err("Não foi possível salvar a atividade."); return false; }
-  agendaForm.title = ""; agendaForm.description = ""; agendaForm.time = ""; agendaForm.priority = "media"; agendaForm.repeat = "none";
+  if(error){ console.error("[agenda] falha ao salvar:", error.message); err("Não foi possível salvar a atividade."); return false; }
+  agendaForm.title = ""; agendaForm.description = ""; agendaForm.date = todayISO(); agendaForm.time = ""; agendaForm.priority = "media"; agendaForm.repeat = "none";
   state.agenda.showForm = false;
   await refreshTasks(); ok("Atividade adicionada à agenda."); render();
   return false;
