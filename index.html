@@ -412,6 +412,38 @@ function addBusinessDays(days){
 }
 const DEFAULT_SLA_BUSINESS_DAYS = 2;
 function parseFields(v){ return Array.isArray(v) ? v.filter((f) => f && typeof f === "object" && "id" in f) : []; }
+// ---- Campos de destaque (resumo mostrado no Acompanhamento) ----
+// O master marca, em cada tipo, quais campos aparecem no resumo do ticket.
+// Enquanto um tipo não tiver nenhum campo marcado, a escolha é automática:
+// prioriza campos que costumam identificar o pedido (nome, CNPJ, cargo…).
+const DESTAQUE_PALAVRAS = /nome|raz[aã]o|colaborador|funcion[aá]ri|candidat|fornecedor|prestador|cliente|empresa|cnpj|cpf|cargo|fun[cç][aã]o|empreendimento|obra|unidade|produto|servi[cç]o|assunto|valor|compet[eê]ncia|m[eê]s|nota|nf|contrato/i;
+const DESTAQUE_MAX_AUTO = 3;
+function destaquesAutomaticos(fields){
+  const candidatos = fields.filter((f) => f.type !== "anexo" && f.type !== "textarea");
+  const fortes = candidatos.filter((f) => DESTAQUE_PALAVRAS.test(f.label || ""));
+  const escolhidos = fortes.slice(0, DESTAQUE_MAX_AUTO);
+  // Sem palavra-chave suficiente: completa com os primeiros campos curtos.
+  if(escolhidos.length < 2) candidatos.forEach((f) => { if(escolhidos.length < 2 && !escolhidos.includes(f)) escolhidos.push(f); });
+  // Tipo só com texto longo: usa o primeiro texto longo.
+  if(!escolhidos.length){ const longo = fields.find((f) => f.type === "textarea"); if(longo) escolhidos.push(longo); }
+  return escolhidos.map((f) => f.id);
+}
+function camposDestaque(type){
+  const fields = parseFields(type && type.fields);
+  const marcados = fields.filter((f) => f.destaque === true && f.type !== "anexo");
+  if(marcados.length) return marcados;
+  const ids = destaquesAutomaticos(fields);
+  return fields.filter((f) => ids.includes(f.id));
+}
+function valorResposta(f, v, max){
+  if(v == null || v === "") return "";
+  let txt;
+  if(f.type === "anexo") txt = (v && v.name) ? v.name : (v && v.url ? "arquivo anexado" : "");
+  else if(f.type === "date") txt = formatDate(String(v));
+  else txt = String(v);
+  txt = txt.replace(/\s+/g, " ").trim();
+  return max && txt.length > max ? txt.slice(0, max - 1) + "…" : txt;
+}
 function formatDate(value){
   if(!value) return "Sem prazo";
   const date = value.length <= 10 ? new Date(value+"T12:00:00") : new Date(value);
@@ -544,8 +576,8 @@ const state = {
   requestsArchiveLoaded: false, requestsArchiveLoading: false,
   requestsFullArchiveLoaded: false, requestsFullArchiveLoading: false,
   filters: {
-    painelDep: "todos", painelPeriod: "90", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
-    relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos",
+    painelDep: "todos", painelPeriod: "90", painelFrom: "", painelTo: "", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
+    relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos", acompType: "todos", acompSearch: "",
   },
   agenda: { showForm: false, showDone: false, viewUserId: "", editTask: null },
   painelExpanded: {},
@@ -890,7 +922,7 @@ async function render(){
     ensureArchiveLoaded().then(render);
   }
   // Períodos maiores que a janela "recente" (120 dias) precisam do histórico completo.
-  const periodoAmplo = (v) => v === "todos" || Number(v) > ARCHIVE_RECENT_DAYS;
+  const periodoAmplo = (v) => v === "todos" || v === "custom" || Number(v) > ARCHIVE_RECENT_DAYS;
   if(!state.requestsFullArchiveLoaded && !state.requestsFullArchiveLoading && (
     (path.startsWith("/painel") && periodoAmplo(state.filters.painelPeriod)) ||
     (path.startsWith("/relatorios") && periodoAmplo(state.filters.relPeriod)) ||
@@ -1108,7 +1140,11 @@ function filteredRequests(){
   // Quem não é master vê no quadro apenas as solicitações sob sua responsabilidade.
   if(!state.isMaster) list = list.filter((r) => r.assignee_id === state.user.id);
   if(f.painelDep !== "todos") list = list.filter((r) => r.target_department_id === f.painelDep || r.requester_department_id === f.painelDep);
-  if(f.painelPeriod !== "todos"){
+  if(f.painelPeriod === "custom"){
+    // Filtra pela data de abertura, como os demais períodos.
+    if(f.painelFrom) list = list.filter((r) => String(r.created_at||"").slice(0,10) >= f.painelFrom);
+    if(f.painelTo) list = list.filter((r) => String(r.created_at||"").slice(0,10) <= f.painelTo);
+  } else if(f.painelPeriod !== "todos"){
     const limit = Date.now() - Number(f.painelPeriod)*86400000;
     list = list.filter((r) => new Date(r.created_at).getTime() >= limit);
   }
@@ -1139,6 +1175,13 @@ function viewPainel(){
       '<input id="painelSearchInput" class="inp pl-8" placeholder="Buscar por número (#0001)" value="'+esc(state.filters.painelSearch)+'" oninput="debouncedFilter(\'painelSearch\',this.value)" /></div>'+
     '<select class="inp w-52" onchange="state.filters.painelDep=this.value;render()">'+depOpts+'</select>'+
     '<select class="inp w-48" onchange="state.filters.painelPeriod=this.value;render()">'+periodOpts+'</select>'+
+    (state.filters.painelPeriod === "custom"
+      ? '<div class="flex items-center gap-1.5">'+
+          '<input class="inp w-40" type="date" title="Aberta a partir de" aria-label="Data inicial" value="'+esc(state.filters.painelFrom)+'" onchange="state.filters.painelFrom=this.value;render()" />'+
+          '<span class="text-xs text-muted-foreground">até</span>'+
+          '<input class="inp w-40" type="date" title="Aberta até" aria-label="Data final" value="'+esc(state.filters.painelTo)+'" onchange="state.filters.painelTo=this.value;render()" />'+
+        '</div>'
+      : "")+
     '<select class="inp w-48" onchange="state.filters.painelTag=this.value;render()">'+tagOpts+'</select>'+
     (state.isMaster ? '<select class="inp w-56" onchange="state.filters.painelAssignee=this.value;render()">'+assigneeOpts+'</select>' : "")+
   '</div>';
@@ -1244,6 +1287,40 @@ async function moveStatus(id, status){
 }
 
 /* ============================ Acompanhamento (minhas solicitações) ============================ */
+// ---- Resumo do ticket no Acompanhamento ----
+function normalizarBusca(t){ return String(t||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""); }
+function textoBuscavel(r){
+  const tipo = state.types.find((t) => t.id === r.request_type_id);
+  const campos = parseFields(tipo && tipo.fields);
+  const respostas = r.form_data || {};
+  const partes = [pad4(r.code), String(r.code), r.title, tipo ? tipo.name : ""];
+  campos.forEach((f) => partes.push(valorResposta(f, respostas[f.id])));
+  // Respostas de campos que já saíram do tipo também contam na busca.
+  Object.values(respostas).forEach((v) => { if(typeof v === "string" || typeof v === "number") partes.push(String(v)); });
+  return normalizarBusca(partes.join(" "));
+}
+function resumoTicket(r, tipo){
+  const respostas = r.form_data || {};
+  const itens = camposDestaque(tipo)
+    .map((f) => ({ f, v: valorResposta(f, respostas[f.id], 60) }))
+    .filter((x) => x.v);
+  return itens.map((x) => '<span title="'+esc(x.f.label)+'">'+esc(x.v)+'</span>').join(' <span aria-hidden="true">·</span> ');
+}
+function balaoTicket(r, tipo){
+  const respostas = r.form_data || {};
+  const campos = parseFields(tipo && tipo.fields);
+  const linhas = campos
+    .map((f) => ({ f, v: valorResposta(f, respostas[f.id], 180) }))
+    .filter((x) => x.v)
+    .map((x) => '<div class="py-1"><dt class="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">'+esc(x.f.label)+'</dt>'+
+      '<dd class="text-xs text-foreground">'+(x.f.type === "anexo" ? "📎 " : "")+esc(x.v)+'</dd></div>');
+  const corpo = linhas.length ? '<dl class="mt-1 divide-y divide-border">'+linhas.join("")+'</dl>'
+    : '<p class="mt-1 text-xs text-muted-foreground">Sem informações extras preenchidas no formulário.</p>';
+  // Balão só no desktop (passar o mouse). No celular o clique abre o card normalmente.
+  return '<span role="tooltip" class="pointer-events-none invisible absolute left-0 top-full z-40 mt-2 hidden w-80 max-w-[80vw] rounded-lg border border-border bg-card p-3 text-left opacity-0 shadow-lg transition-opacity duration-150 md:block group-hover:visible group-hover:opacity-100">'+
+    '<span class="block text-xs font-semibold text-foreground">'+esc(tipo ? tipo.name : "Solicitação")+'</span>'+
+    corpo+'</span>';
+}
 function viewAcompanhamento(){
   const status = state.filters.acompStatus;
   let mine = state.requests.filter((r) => r.requester_id === state.user.id);
@@ -1251,7 +1328,16 @@ function viewAcompanhamento(){
   const open = mine.filter((r) => r.status !== "concluida" && r.status !== "cancelada").length;
   const late = mine.filter((r) => r.status !== "concluida" && r.status !== "cancelada" && (daysUntil(r.due_date) ?? 1) < 0).length;
   if(status !== "todos") mine = mine.filter((r) => r.status === status);
+  const tipoSel = state.filters.acompType;
+  if(tipoSel !== "todos") mine = mine.filter((r) => (r.request_type_id || "") === (tipoSel === "sem" ? "" : tipoSel));
+  const busca = normalizarBusca(state.filters.acompSearch.trim().replace(/^#/,""));
+  if(busca) mine = mine.filter((r) => textoBuscavel(r).includes(busca));
   mine = mine.slice().sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
+  const meusTipos = [...new Set(state.requests.filter((r) => r.requester_id === state.user.id).map((r) => r.request_type_id || ""))];
+  const typeOpts = '<option value="todos">Todos os tipos</option>'+
+    meusTipos.map((id) => ({ id, nome: id ? ((state.types.find((t) => t.id === id)||{}).name || "Tipo removido") : "Sem tipo" }))
+      .sort((a,b) => a.nome.localeCompare(b.nome))
+      .map((o) => '<option value="'+(o.id||"sem")+'"'+((o.id||"sem")===tipoSel?" selected":"")+'>'+esc(o.nome)+'</option>').join("");
 
   const statusTabs = '<option value="todos">Todos os status</option>'+
     STATUS_ORDER.map((s) => '<option value="'+s+'"'+(s===status?" selected":"")+'>'+STATUS_LABEL[s]+'</option>').join("");
@@ -1267,10 +1353,16 @@ function viewAcompanhamento(){
   const rows = mine.length ? visibleMine.map((r) => {
     const diff = daysUntil(r.due_date);
     const late = r.status !== "concluida" && r.status !== "cancelada" && diff !== null && diff < 0;
+    const tipo = state.types.find((t) => t.id === r.request_type_id);
+    const resumo = resumoTicket(r, tipo);
     return '<a href="#/solicitacao/'+r.id+'" class="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card p-3.5 shadow-card hover:border-ring">'+
       '<span class="font-mono text-xs text-muted-foreground">#'+pad4(r.code)+'</span>'+
       '<span class="size-2 rounded-full '+STATUS_DOT[r.status]+'"></span>'+
-      '<span class="flex-1 min-w-[10rem] font-display text-sm font-semibold">'+esc(r.title)+'</span>'+
+      '<span class="group relative flex-1 min-w-[10rem]">'+
+        '<span class="block font-display text-sm font-semibold group-hover:underline">'+esc(r.title)+'</span>'+
+        (resumo ? '<span class="mt-0.5 block truncate text-xs text-muted-foreground">'+resumo+'</span>' : "")+
+        balaoTicket(r, tipo)+
+      '</span>'+
       '<span class="text-xs text-muted-foreground">'+esc(depById(r.target_department_id))+'</span>'+
       '<span class="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-secondary-foreground">'+STATUS_LABEL[r.status]+'</span>'+
       '<span class="text-[11px] font-medium '+(late?"text-destructive":"text-muted-foreground")+'">'+deadlineLabel(r.due_date, r.status)+'</span>'+
@@ -1278,13 +1370,18 @@ function viewAcompanhamento(){
   }).join("") + (hiddenMine > 0
       ? '<button type="button" class="w-full rounded-lg border border-dashed border-border py-2.5 text-xs font-medium text-muted-foreground hover:text-foreground" onclick="state.painelExpanded.__acomp=true;render()">Mostrar todas as '+mine.length+' (+'+hiddenMine+')</button>'
       : "")
-    : '<p class="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Nenhuma solicitação encontrada.</p>';
+    : '<p class="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">Nenhuma solicitação encontrada'+(busca || tipoSel !== "todos" ? " com esses filtros" : "")+'.</p>';
 
   return '<div class="mx-auto max-w-4xl">'+
     '<div class="flex flex-wrap items-end justify-between gap-4">'+
       '<div><h1 class="text-3xl font-bold">Acompanhamento</h1>'+
       '<p class="mt-1 text-sm text-muted-foreground">Solicitações que você abriu e o andamento de cada uma.</p></div>'+
-      '<select class="inp w-56" onchange="state.filters.acompStatus=this.value;render()">'+statusTabs+'</select>'+
+      '<div class="flex flex-wrap items-center gap-2">'+
+        '<div class="relative w-64"><span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
+          '<input id="acompSearchInput" class="inp pl-8" placeholder="Buscar: nome, CNPJ, nº…" value="'+esc(state.filters.acompSearch)+'" oninput="debouncedFilter(\'acompSearch\',this.value)" /></div>'+
+        '<select class="inp w-52" onchange="state.filters.acompType=this.value;render()">'+typeOpts+'</select>'+
+        '<select class="inp w-48" onchange="state.filters.acompStatus=this.value;render()">'+statusTabs+'</select>'+
+      '</div>'+
     '</div>'+
     '<div class="mt-6 grid gap-4 sm:grid-cols-3">'+
       kpi("Total de solicitações", total)+kpi("Em aberto", open)+kpi("Em atraso", late, "destructive")+
@@ -1973,7 +2070,11 @@ function viewTipos(){
         (f.type === "select" ? '<input class="inp" placeholder="Opções separadas por vírgula" value="'+esc(f.optionsRaw != null ? f.optionsRaw : (f.options||[]).join(", "))+'" '+
           'oninput="state.tipos.fields['+i+'].optionsRaw=this.value" '+
           'onblur="patchField('+i+',{options:this.value.split(\',\').map(function(o){return o.trim()}).filter(Boolean),optionsRaw:this.value})" />' : "")+
-        '<label class="flex items-center gap-2 text-xs text-muted-foreground"><button type="button" class="switch" data-on="'+(f.required?1:0)+'" onclick="patchField('+i+',{required:'+(!f.required)+'},true)"></button>Campo obrigatório</label>'+
+        '<div class="flex flex-wrap items-center gap-x-6 gap-y-2">'+
+          '<label class="flex items-center gap-2 text-xs text-muted-foreground"><button type="button" class="switch" data-on="'+(f.required?1:0)+'" onclick="patchField('+i+',{required:'+(!f.required)+'},true)"></button>Campo obrigatório</label>'+
+          (f.type === "anexo" ? "" :
+          '<label class="flex items-center gap-2 text-xs text-muted-foreground" title="Aparece no resumo do ticket, na tela de Acompanhamento"><button type="button" class="switch" data-on="'+(f.destaque?1:0)+'" onclick="patchField('+i+',{destaque:'+(!f.destaque)+'},true)"></button>Mostrar no acompanhamento</label>')+
+        '</div>'+
       '</div>').join("");
   const fiscalAssigneeOpts = '<option value="">Selecione</option>'+state.profiles.map((pr) => '<option value="'+pr.id+'"'+(pr.id===t.fiscalAssigneeId?" selected":"")+'>'+esc(pr.full_name||pr.email)+'</option>').join("");
 
@@ -1988,7 +2089,7 @@ function viewTipos(){
         '<button class="switch" data-on="'+(ty.is_active?1:0)+'" '+(state.isMaster?'onclick="toggleTipo(\''+ty.id+'\','+(!ty.is_active)+')"':'disabled style="opacity:.5;cursor:not-allowed"')+'></button>'+
       '</div>'+
       (ty.description ? '<p class="mt-2 text-sm text-muted-foreground">'+esc(ty.description)+'</p>' : "")+
-      '<div class="mt-3 flex flex-wrap gap-1.5">'+parseFields(ty.fields).map((f) => '<span class="rounded-full bg-secondary px-2.5 py-0.5 text-[11px] text-secondary-foreground">'+esc(f.label)+(f.required?" *":"")+'</span>').join("")+'</div>'+
+      '<div class="mt-3 flex flex-wrap gap-1.5">'+(function(){ const dest = camposDestaque(ty).map((x) => x.id); return parseFields(ty.fields).map((f) => '<span class="rounded-full px-2.5 py-0.5 text-[11px] '+(dest.includes(f.id) ? "bg-accent/25 font-medium text-accent-foreground" : "bg-secondary text-secondary-foreground")+'"'+(dest.includes(f.id) ? ' title="Aparece no resumo do Acompanhamento"' : "")+'>'+(dest.includes(f.id) ? "★ " : "")+esc(f.label)+(f.required?" *":"")+'</span>').join(""); })()+'</div>'+
       (state.isMaster ? '<button type="button" class="btn btn-outline btn-sm mt-3" onclick="editarTipo(\''+ty.id+'\')">Editar</button>' : "")+
     '</div>').join("")
     : '<p class="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">Nenhum tipo cadastrado ainda.</p>';
@@ -2048,7 +2149,15 @@ function editarTipo(id){
     editingId: ty.id, name: ty.name || "", description: ty.description || "",
     departmentId: ty.department_id || "", ownerId: ty.owner_id || "",
     sla: ty.default_sla_days || DEFAULT_SLA_BUSINESS_DAYS, tag: ty.tag || "",
-    fields: parseFields(ty.fields).map((f) => ({ id:f.id, label:f.label, type:f.type, required:!!f.required, options:f.options||[] })),
+    fields: (function(){
+      const lista = parseFields(ty.fields);
+      // Nenhum campo marcado ainda: já abre com a sugestão automática marcada,
+      // para o master só revisar e salvar.
+      const temMarcado = lista.some((f) => f.destaque === true);
+      const auto = temMarcado ? [] : destaquesAutomaticos(lista);
+      return lista.map((f) => ({ id:f.id, label:f.label, type:f.type, required:!!f.required, options:f.options||[],
+        destaque: temMarcado ? f.destaque === true : auto.includes(f.id) }));
+    })(),
     needsFiscal: !!ty.needs_fiscal_registration, fiscalAssigneeId: ty.fiscal_assignee_id || "",
   };
   window.scrollTo(0,0);
@@ -2070,7 +2179,7 @@ async function criarTipo(e){
     name: t.name.trim(), description: t.description.trim(), department_id: t.departmentId,
     default_sla_days: t.sla, owner_id: t.ownerId || null, tag: t.tag.trim() || null,
     needs_fiscal_registration: t.needsFiscal, fiscal_assignee_id: t.needsFiscal ? t.fiscalAssigneeId : null,
-    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[] })),
+    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[], destaque: f.type !== "anexo" && f.destaque === true })),
   };
   const { error } = t.editingId
     ? await sb.from("request_types").update(payload).eq("id", t.editingId)
@@ -2469,6 +2578,7 @@ async function mesclarPerfis(keepId, removeId){
 
 /* ============================ Relatórios ============================ */
 const PERIODS = [
+  { value:"7", label:"Últimos 7 dias" },
   { value:"30", label:"Últimos 30 dias" }, { value:"90", label:"Últimos 90 dias" },
   { value:"365", label:"Últimos 12 meses" }, { value:"todos", label:"Todo o período" },
   { value:"custom", label:"Período específico…" },
