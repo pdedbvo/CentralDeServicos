@@ -577,7 +577,7 @@ const state = {
   requestsFullArchiveLoaded: false, requestsFullArchiveLoading: false,
   filters: {
     painelDep: "todos", painelPeriod: "90", painelFrom: "", painelTo: "", painelTag: "todos", painelAssignee: "todos", painelSearch: "",
-    relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos", acompType: "todos", acompSearch: "",
+    relPeriod: "90", relDep: "todos", relFrom: "", relTo: "", agendaRange: "todos", acompStatus: "todos", acompType: "todos", acompSearch: "", acompUser: "",
   },
   agenda: { showForm: false, showDone: false, viewUserId: "", editTask: null },
   painelExpanded: {},
@@ -1323,7 +1323,11 @@ function balaoTicket(r, tipo){
 }
 function viewAcompanhamento(){
   const status = state.filters.acompStatus;
-  let mine = state.requests.filter((r) => r.requester_id === state.user.id);
+  // Master pode ver o acompanhamento de outra pessoa ("" = o próprio, "todas" = todo mundo).
+  const alvo = state.isMaster ? (state.filters.acompUser || "") : "";
+  const doAlvo = (r) => alvo === "todas" ? true : r.requester_id === (alvo || state.user.id);
+  const vendoOutro = !!alvo;
+  let mine = state.requests.filter(doAlvo);
   const total = mine.length;
   const open = mine.filter((r) => r.status !== "concluida" && r.status !== "cancelada").length;
   const late = mine.filter((r) => r.status !== "concluida" && r.status !== "cancelada" && (daysUntil(r.due_date) ?? 1) < 0).length;
@@ -1333,7 +1337,11 @@ function viewAcompanhamento(){
   const busca = normalizarBusca(state.filters.acompSearch.trim().replace(/^#/,""));
   if(busca) mine = mine.filter((r) => textoBuscavel(r).includes(busca));
   mine = mine.slice().sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
-  const meusTipos = [...new Set(state.requests.filter((r) => r.requester_id === state.user.id).map((r) => r.request_type_id || ""))];
+  const meusTipos = [...new Set(state.requests.filter(doAlvo).map((r) => r.request_type_id || ""))];
+  const pessoaOpts = '<option value="">Minhas solicitações</option>'+
+    '<option value="todas"'+(alvo==="todas"?" selected":"")+'>Todas as pessoas</option>'+
+    state.profiles.filter((pr) => pr.id !== state.user.id)
+      .map((pr) => '<option value="'+pr.id+'"'+(pr.id===alvo?" selected":"")+'>'+esc(pr.full_name || pr.email)+'</option>').join("");
   const typeOpts = '<option value="todos">Todos os tipos</option>'+
     meusTipos.map((id) => ({ id, nome: id ? ((state.types.find((t) => t.id === id)||{}).name || "Tipo removido") : "Sem tipo" }))
       .sort((a,b) => a.nome.localeCompare(b.nome))
@@ -1363,7 +1371,7 @@ function viewAcompanhamento(){
         (resumo ? '<span class="mt-0.5 block truncate text-xs text-muted-foreground">'+resumo+'</span>' : "")+
         balaoTicket(r, tipo)+
       '</span>'+
-      '<span class="text-xs text-muted-foreground">'+esc(depById(r.target_department_id))+'</span>'+
+      '<span class="text-xs text-muted-foreground">'+(alvo === "todas" ? '<span class="font-medium text-foreground">'+esc(nameById(r.requester_id))+'</span> · ' : "")+esc(depById(r.target_department_id))+'</span>'+
       '<span class="rounded-full bg-secondary px-2 py-0.5 text-[11px] font-medium text-secondary-foreground">'+STATUS_LABEL[r.status]+'</span>'+
       '<span class="text-[11px] font-medium '+(late?"text-destructive":"text-muted-foreground")+'">'+deadlineLabel(r.due_date, r.status)+'</span>'+
     '</a>';
@@ -1374,11 +1382,12 @@ function viewAcompanhamento(){
 
   return '<div class="mx-auto max-w-4xl">'+
     '<div class="flex flex-wrap items-end justify-between gap-4">'+
-      '<div><h1 class="text-3xl font-bold">Acompanhamento</h1>'+
-      '<p class="mt-1 text-sm text-muted-foreground">Solicitações que você abriu e o andamento de cada uma.</p></div>'+
+      '<div><h1 class="text-3xl font-bold">'+(alvo === "todas" ? "Acompanhamento geral" : vendoOutro ? "Acompanhamento de "+esc(nameById(alvo)) : "Acompanhamento")+'</h1>'+
+      '<p class="mt-1 text-sm text-muted-foreground">'+(alvo === "todas" ? "Solicitações abertas por todas as pessoas." : vendoOutro ? "Solicitações que essa pessoa abriu e o andamento de cada uma." : "Solicitações que você abriu e o andamento de cada uma.")+'</p></div>'+
       '<div class="flex flex-wrap items-center gap-2">'+
         '<div class="relative w-64"><span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
           '<input id="acompSearchInput" class="inp pl-8" placeholder="Buscar: nome, CNPJ, nº…" value="'+esc(state.filters.acompSearch)+'" oninput="debouncedFilter(\'acompSearch\',this.value)" /></div>'+
+        (state.isMaster ? '<select class="inp w-56" aria-label="De quem" onchange="state.filters.acompUser=this.value;state.filters.acompType=\'todos\';state.painelExpanded.__acomp=false;render()">'+pessoaOpts+'</select>' : "")+
         '<select class="inp w-52" onchange="state.filters.acompType=this.value;render()">'+typeOpts+'</select>'+
         '<select class="inp w-48" onchange="state.filters.acompStatus=this.value;render()">'+statusTabs+'</select>'+
       '</div>'+
@@ -1529,6 +1538,9 @@ async function criarSolicitacao(e){
     assignee_id: n.assignee || null, request_type_id: n.typeId || null,
     requester_nome: state.profile ? (state.profile.full_name || state.profile.email) : "",
     requester_email: state.profile ? state.profile.email : "",
+    // Respostas do formulário, para o e-mail já sair com as informações do pedido.
+    form_data: formDataOriginal,
+    anexos_pendentes: Object.fromEntries(Object.entries(n.files || {}).filter(([,f]) => f && f.name).map(([id,f]) => [id, f.name])),
   });
   const arquivosPendentes = { ...n.files };
   state.novo = { typeId:"", target:"", title:"", priority:"media", due: addBusinessDays(DEFAULT_SLA_BUSINESS_DAYS), assignee:"", formData:{}, files:{} };
@@ -2074,6 +2086,7 @@ function viewTipos(){
           '<label class="flex items-center gap-2 text-xs text-muted-foreground"><button type="button" class="switch" data-on="'+(f.required?1:0)+'" onclick="patchField('+i+',{required:'+(!f.required)+'},true)"></button>Campo obrigatório</label>'+
           (f.type === "anexo" ? "" :
           '<label class="flex items-center gap-2 text-xs text-muted-foreground" title="Aparece no resumo do ticket, na tela de Acompanhamento"><button type="button" class="switch" data-on="'+(f.destaque?1:0)+'" onclick="patchField('+i+',{destaque:'+(!f.destaque)+'},true)"></button>Mostrar no acompanhamento</label>')+
+          '<label class="flex items-center gap-2 text-xs text-muted-foreground" title="Para dados sensíveis (CPF, salário…): o campo nunca aparece nos e-mails automáticos"><button type="button" class="switch" data-on="'+(f.naoEmail?1:0)+'" onclick="patchField('+i+',{naoEmail:'+(!f.naoEmail)+'},true)"></button>Não enviar por e-mail</label>'+
         '</div>'+
       '</div>').join("");
   const fiscalAssigneeOpts = '<option value="">Selecione</option>'+state.profiles.map((pr) => '<option value="'+pr.id+'"'+(pr.id===t.fiscalAssigneeId?" selected":"")+'>'+esc(pr.full_name||pr.email)+'</option>').join("");
@@ -2089,7 +2102,7 @@ function viewTipos(){
         '<button class="switch" data-on="'+(ty.is_active?1:0)+'" '+(state.isMaster?'onclick="toggleTipo(\''+ty.id+'\','+(!ty.is_active)+')"':'disabled style="opacity:.5;cursor:not-allowed"')+'></button>'+
       '</div>'+
       (ty.description ? '<p class="mt-2 text-sm text-muted-foreground">'+esc(ty.description)+'</p>' : "")+
-      '<div class="mt-3 flex flex-wrap gap-1.5">'+(function(){ const dest = camposDestaque(ty).map((x) => x.id); return parseFields(ty.fields).map((f) => '<span class="rounded-full px-2.5 py-0.5 text-[11px] '+(dest.includes(f.id) ? "bg-accent/25 font-medium text-accent-foreground" : "bg-secondary text-secondary-foreground")+'"'+(dest.includes(f.id) ? ' title="Aparece no resumo do Acompanhamento"' : "")+'>'+(dest.includes(f.id) ? "★ " : "")+esc(f.label)+(f.required?" *":"")+'</span>').join(""); })()+'</div>'+
+      '<div class="mt-3 flex flex-wrap gap-1.5">'+(function(){ const dest = camposDestaque(ty).map((x) => x.id); return parseFields(ty.fields).map((f) => '<span class="rounded-full px-2.5 py-0.5 text-[11px] '+(dest.includes(f.id) ? "bg-secondary font-semibold text-foreground ring-1 ring-border" : "bg-secondary text-secondary-foreground")+'"'+(dest.includes(f.id) ? ' title="Aparece no resumo do Acompanhamento"' : "")+'>'+(dest.includes(f.id) ? "★ " : "")+esc(f.label)+(f.required?" *":"")+(f.naoEmail ? ' <span class="font-normal text-muted-foreground" title="Não enviado por e-mail">· sem e-mail</span>' : "")+'</span>').join(""); })()+'</div>'+
       (state.isMaster ? '<button type="button" class="btn btn-outline btn-sm mt-3" onclick="editarTipo(\''+ty.id+'\')">Editar</button>' : "")+
     '</div>').join("")
     : '<p class="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">Nenhum tipo cadastrado ainda.</p>';
@@ -2156,7 +2169,7 @@ function editarTipo(id){
       const temMarcado = lista.some((f) => f.destaque === true);
       const auto = temMarcado ? [] : destaquesAutomaticos(lista);
       return lista.map((f) => ({ id:f.id, label:f.label, type:f.type, required:!!f.required, options:f.options||[],
-        destaque: temMarcado ? f.destaque === true : auto.includes(f.id) }));
+        destaque: temMarcado ? f.destaque === true : auto.includes(f.id), naoEmail: f.naoEmail === true }));
     })(),
     needsFiscal: !!ty.needs_fiscal_registration, fiscalAssigneeId: ty.fiscal_assignee_id || "",
   };
@@ -2179,7 +2192,7 @@ async function criarTipo(e){
     name: t.name.trim(), description: t.description.trim(), department_id: t.departmentId,
     default_sla_days: t.sla, owner_id: t.ownerId || null, tag: t.tag.trim() || null,
     needs_fiscal_registration: t.needsFiscal, fiscal_assignee_id: t.needsFiscal ? t.fiscalAssigneeId : null,
-    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[], destaque: f.type !== "anexo" && f.destaque === true })),
+    fields: t.fields.map((f) => ({ id:f.id, label:f.label.trim(), type:f.type, required:f.required, options:f.options||[], destaque: f.type !== "anexo" && f.destaque === true, naoEmail: f.naoEmail === true })),
   };
   const { error } = t.editingId
     ? await sb.from("request_types").update(payload).eq("id", t.editingId)
@@ -2204,7 +2217,13 @@ const EMAIL_RULES = [
   { key:"convite_acesso", label:"Convite de acesso" },
   { key:"aguardando_diario", label:"Aguardando informações (diário, 8h)" },
   { key:"atraso_diario", label:"Lembrete de atraso (diário, 8h)" },
+  { key:"fila_emails", label:"Fila de reenvio", fila:true },
 ];
+function dataHoraCurta(iso){
+  if(!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleDateString("pt-BR", { day:"2-digit", month:"2-digit", year:"2-digit" })+" "+d.toLocaleTimeString("pt-BR", { hour:"2-digit", minute:"2-digit" });
+}
 function viewConfiguracoes(){
   const gasUrl = state.settings.email_gas_url || "";
   const secret = state.settings.email_shared_secret || "";
@@ -2214,17 +2233,25 @@ function viewConfiguracoes(){
   const anexosConfigurado = !!(anexosUrl && anexosSecret);
   const statusRows = EMAIL_RULES.map((rule) => {
     const st = state.emailStatus && state.emailStatus[rule.key];
-    const quando = st && st.lastRunAt ? formatDate(st.lastRunAt) + " " + new Date(st.lastRunAt).toLocaleTimeString("pt-BR",{hour:"2-digit",minute:"2-digit"}) : "Nunca rodou";
-    const okBadge = !st ? '<span class="rounded-full bg-secondary px-2 py-0.5 text-[11px] text-secondary-foreground">Sem dados</span>'
-      : st.ok ? '<span class="rounded-full px-2 py-0.5 text-[11px] font-medium" style="background:var(--ok-bg);color:var(--status-concluida)">OK</span>'
-      : '<span class="rounded-full bg-destructive/15 px-2 py-0.5 text-[11px] font-medium text-destructive">Erro</span>';
-    return '<tr class="border-b border-border/60 last:border-0">'+
-      '<td class="py-2 pr-3 font-medium">'+rule.label+'</td>'+
-      '<td class="py-2 pr-3 text-muted-foreground">'+quando+'</td>'+
-      '<td class="py-2 pr-3">'+okBadge+(st && st.sentCount != null ? '<span class="ml-2 text-xs text-muted-foreground">'+st.sentCount+' enviado(s)</span>' : "")+'</td>'+
-      '<td class="py-2 text-destructive text-xs">'+(st && st.lastError ? esc(st.lastError) : "")+'</td>'+
+    const badge = (txt, estilo) => '<span class="whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-medium" style="'+estilo+'">'+txt+'</span>';
+    const situacao = !st ? badge("Sem envios ainda", "background:var(--secondary);color:var(--secondary-foreground)")
+      : st.ok ? badge("OK", "background:var(--ok-bg);color:var(--status-concluida)")
+      : (rule.fila || /fila/i.test(st.lastError || "")) ? badge("Atenção", "background:color-mix(in srgb, var(--status-aguardando) 22%, transparent);color:var(--foreground)")
+      : badge("Erro", "background:color-mix(in srgb, var(--destructive) 15%, transparent);color:var(--destructive)");
+    const ultimoEnvio = st && st.lastSentAt ? dataHoraCurta(st.lastSentAt) : '<span class="text-muted-foreground">Nenhum</span>';
+    const total = st ? (Number(st.totalEnviado) || 0) : 0;
+    const detalhe = rule.fila
+      ? (st && st.pendentes ? '<span class="font-medium">'+st.pendentes+' aguardando reenvio</span>' : '<span class="text-muted-foreground">Fila vazia</span>')
+      : (st && st.lastRunAt ? '<span class="text-muted-foreground">Última execução: '+dataHoraCurta(st.lastRunAt)+(st.sentCount != null ? ' · '+st.sentCount+' enviado(s)' : "")+'</span>' : "");
+    return '<tr class="border-b border-border/60 align-top last:border-0">'+
+      '<td class="py-2.5 pr-3"><p class="font-medium">'+rule.label+'</p><p class="mt-0.5 text-[11px]">'+detalhe+'</p></td>'+
+      '<td class="py-2.5 pr-3">'+situacao+'</td>'+
+      '<td class="py-2.5 pr-3 whitespace-nowrap">'+ultimoEnvio+'</td>'+
+      '<td class="py-2.5 pr-3 text-right font-mono">'+total.toLocaleString("pt-BR")+'</td>'+
+      '<td class="py-2.5 text-xs text-destructive">'+(st && st.lastError && !st.ok ? esc(st.lastError) : "")+'</td>'+
     '</tr>';
   }).join("");
+  const provedorAtual = (Object.values(state.emailStatus || {}).sort((a,b) => String(b.lastRunAt||"").localeCompare(String(a.lastRunAt||"")))[0] || {}).provedor || "";
 
   return '<div class="mx-auto max-w-4xl"><h1 class="text-3xl font-bold">Configurações</h1>'+
     '<p class="mt-1 text-sm text-muted-foreground">Conexão com o serviço de e-mails (Google Apps Script), testes manuais e status dos envios.</p>'+
@@ -2271,11 +2298,12 @@ function viewConfiguracoes(){
     '</section>'+
 
     '<section class="mt-8 rounded-xl border border-border bg-card p-6 shadow-card">'+
-      '<div class="flex items-center justify-between"><h2 class="text-sm font-semibold">Status dos envios</h2>'+
+      '<div class="flex items-center justify-between"><div><h2 class="text-sm font-semibold">Status dos envios</h2>'+
+        '<p class="mt-0.5 text-xs text-muted-foreground">Total enviado conta a partir da instalação desta versão do script.'+(provedorAtual ? ' Enviando por: <span class="font-medium text-foreground">'+esc(provedorAtual)+'</span>.' : "")+'</p></div>'+
         '<button type="button" class="btn btn-ghost btn-sm" onclick="refreshEmailStatus().then(render)">Atualizar</button></div>'+
       '<div class="mt-4 overflow-x-auto"><table class="w-full text-sm">'+
         '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground">'+
-          '<th class="pb-2 font-medium">Regra</th><th class="pb-2 font-medium">Última vez que rodou</th><th class="pb-2 font-medium">Resultado</th><th class="pb-2 font-medium">Erro</th>'+
+          '<th class="pb-2 pr-3 font-medium">Regra</th><th class="pb-2 pr-3 font-medium">Situação</th><th class="pb-2 pr-3 font-medium">Último envio</th><th class="pb-2 pr-3 text-right font-medium">Total enviado</th><th class="pb-2 font-medium">Erro</th>'+
         '</tr></thead><tbody>'+statusRows+'</tbody></table></div>'+
     '</section>'+
   '</div>';
@@ -2307,7 +2335,7 @@ async function testarConexaoAnexos(){
 async function testarConexaoEmail(){
   ok("Testando conexão...");
   const res = await callEmailService("ping", {});
-  if(res.ok) ok("Conectado! O Apps Script respondeu normalmente.");
+  if(res.ok) ok("Conectado! "+(res.provedor ? "Enviando por: "+res.provedor+". " : "")+(res.versao ? "Versão do script: "+res.versao+"." : "O Apps Script respondeu normalmente."));
   else err("Falha na conexão: "+(res.error === "not_configured" ? "salve a URL e a senha primeiro." : res.error));
 }
 async function testarRegraEmail(action){
