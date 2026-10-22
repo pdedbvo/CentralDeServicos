@@ -199,6 +199,13 @@ function makeQuery(table){
   return builder;
 }
 
+// Contador de leituras do banco nesta aba (aparece em Configurações e no
+// console como window.__leituras), para acompanhar o consumo da cota.
+window.__leituras = { total: 0, porColecao: {} };
+function contarLeituras_(tabela, n){
+  window.__leituras.total += n;
+  window.__leituras.porColecao[tabela] = (window.__leituras.porColecao[tabela] || 0) + n;
+}
 async function execute(table, q){
   try{
     const idFilter = q.filters.find((f) => f[0] === "id");
@@ -257,6 +264,7 @@ async function execute(table, q){
     // select
     if(idFilter){
       const doc = await fbDb.collection(table).doc(idFilter[1]).get();
+      contarLeituras_(table, 1);
       const row = fsMapDoc(doc);
       if(q._single && !row) return { data:null, error:{ message:"Registro não encontrado." } };
       return { data: row, error:null };
@@ -266,6 +274,7 @@ async function execute(table, q){
     (q.rangeFilters || []).forEach(([field, val]) => { ref = ref.where(field, ">=", val); });
     q.orders.forEach(([field, opts]) => { ref = ref.orderBy(field, opts.ascending === false ? "desc" : "asc"); });
     const snap = await ref.get();
+    contarLeituras_(table, snap.docs.length || 1);
     const rows = snap.docs.map((d) => Object.assign({ id: d.id }, d.data()));
     if(q._single) return { data: rows[0] || null, error: rows[0] ? null : { message:"Registro não encontrado." } };
     if(q._maybeSingle) return { data: rows[0] || null, error:null };
@@ -586,7 +595,7 @@ const state = {
   pessoa: { editingId: null, name: "", email: "", active: true },
   pessoaBusca: "", pessoaVerTodas: false,
   departamento: { name: "" },
-  detalhe: { request: null, comments: [], comment: "", loading: false },
+  detalhe: { request: null, comments: [], comment: "", loading: false, carregandoId: "", naoEncontradoId: "" },
   uploading: null, // { total, feito, nome } enquanto anexos sobem para o SharePoint
   ready: false,
 };
@@ -618,10 +627,14 @@ async function loadCore(){
     if(state.isMaster || !state.user){
       return Promise.all(ACTIVE_STATUSES.map((s) => sb.from("requests").select("*").eq("status", s)));
     }
-    return Promise.all([
-      sb.from("requests").select("*").eq("assignee_id", state.user.id),
-      sb.from("requests").select("*").eq("requester_id", state.user.id),
-    ]);
+    // Só as ATIVAS de quem é responsável ou solicitante. Duas igualdades na
+    // mesma consulta não exigem índice composto. Antes vinha o histórico
+    // inteiro da pessoa a cada abertura da página.
+    const uid = state.user.id;
+    return Promise.all(ACTIVE_STATUSES.flatMap((st) => [
+      sb.from("requests").select("*").eq("assignee_id", uid).eq("status", st),
+      sb.from("requests").select("*").eq("requester_id", uid).eq("status", st),
+    ]));
   };
 
   const [deps, profs, types, activeReqs, pessoas, settings] = await Promise.all([
@@ -629,7 +642,8 @@ async function loadCore(){
     sb.from("profiles").select("*").order("full_name"),
     sb.from("request_types").select("*").order("name"),
     buscarAtivas(),
-    sb.from("pessoas_cadastradas").select("*").order("full_name"),
+    // Lista de pessoas: só o master usa (tela de cadastro).
+    state.isMaster ? sb.from("pessoas_cadastradas").select("*").order("full_name") : Promise.resolve({ data: [] }),
     sb.from("app_settings").select("*"),
   ]);
   state.departments = deps.data || [];
@@ -654,7 +668,11 @@ async function loadCore(){
   // do app passar a criar o perfil no cadastro), cria agora — senão ela não
   // aparece na lista de pessoas nem pode ser escolhida como responsável.
   if(state.user && !state.profile){
-    const cadastrada = state.pessoas.find((p) => (p.email||"").toLowerCase() === (state.user.email||"").toLowerCase());
+    let cadastrada = state.pessoas.find((p) => (p.email||"").toLowerCase() === (state.user.email||"").toLowerCase());
+    if(!cadastrada && !state.isMaster){
+      const r = await sb.from("pessoas_cadastradas").select("*").eq("email", (state.user.email||"").toLowerCase());
+      cadastrada = (r.data || [])[0] || null;
+    }
     const novoPerfil = {
       full_name: (cadastrada && cadastrada.full_name) || state.user.email.split("@")[0],
       email: state.user.email, department_id: null,
@@ -672,116 +690,171 @@ async function loadCore(){
     if(state.isMaster) await refreshEmailStatus();
   }
 }
-// Carrega o histórico (concluídas/canceladas) só quando alguma tela que
-// precisa dele é aberta (Quadro, Acompanhamento, Relatórios, Agenda) — em
-// vez de sempre, isso evita reler ~1.900 documentos a cada login/ação.
+// ===================== Histórico (concluídas/canceladas) =====================
+// Carregado só quando uma tela precisa dele (Agenda, Quadro, Acompanhamento,
+// Relatórios) e guardado no próprio navegador, no IndexedDB.
 //
-// Duas camadas:
-//  - "recente": concluídas/canceladas dos últimos ARCHIVE_RECENT_DAYS dias.
-//    Carrega sempre que uma tela comum é aberta (cobre os filtros padrão de
-//    90 dias do Quadro e dos Relatórios).
-//  - "completo": TODO o histórico. Só é buscado quando alguém realmente pede
-//    um período maior (ex: "Todo o período" nos Relatórios ou no Quadro).
-const ARCHIVE_RECENT_DAYS = 120;
-const ARCHIVE_CACHE_KEY = "dbvohub_archive_recent_cache_v3"; // v3: descarta caches vazios gravados pela consulta antiga
-const ARCHIVE_FULL_CACHE_KEY = "dbvohub_archive_full_cache_v2";
-const ARCHIVE_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 horas
-function readCache_(key){
+// Por que IndexedDB e não localStorage: o localStorage tem ~5 MB por site, e
+// TODOS os apps publicados em pdedbvo.github.io dividem o mesmo espaço. Quando
+// ele enche, o cache falha em silêncio e o histórico inteiro passa a ser
+// relido do banco a cada F5. O IndexedDB tem espaço muito maior.
+//
+// Master: o cache guarda TODO o histórico e, a cada abertura, busca no banco
+// só o que foi concluído/cancelado desde a última sincronização (uma consulta
+// por data, poucos documentos). Reconstrói do zero uma vez por semana.
+// Demais: guarda o histórico da própria pessoa e renova a cada 12 horas.
+const ARCHIVE_RECENT_DAYS = 120; // usado nos filtros de período
+const ARQUIVO_VERSAO_ = "v4";
+const ARQUIVO_RECONSTRUIR_MASTER_MS = 7 * 24 * 3600 * 1000;
+const ARQUIVO_VALIDADE_PESSOAL_MS = 12 * 3600 * 1000;
+const ARQUIVO_MARGEM_MS = 24 * 3600 * 1000; // folga para relógios diferentes entre computadores
+const IDB_NOME_ = "dbvohub-central-cache", IDB_LOJA_ = "kv";
+let __idb = null;
+function idbAbrir_(){
+  if(__idb) return __idb;
+  __idb = new Promise((resolve, reject) => {
+    try{
+      const req = indexedDB.open(IDB_NOME_, 1);
+      req.onupgradeneeded = () => { try{ req.result.createObjectStore(IDB_LOJA_); }catch(_){} };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch(e){ reject(e); }
+  }).catch(() => null);
+  return __idb;
+}
+async function idbGet_(chave){
   try{
-    const raw = localStorage.getItem(key);
-    if(!raw) return null;
-    const parsed = JSON.parse(raw);
-    if(!parsed.at || Date.now() - parsed.at > ARCHIVE_CACHE_MAX_AGE_MS) return null;
-    return parsed.data;
+    const db = await idbAbrir_(); if(!db) return null;
+    return await new Promise((resolve) => {
+      const q = db.transaction(IDB_LOJA_, "readonly").objectStore(IDB_LOJA_).get(chave);
+      q.onsuccess = () => resolve(q.result || null); q.onerror = () => resolve(null);
+    });
   } catch(_){ return null; }
 }
-function writeCache_(key, data){
-  try{ localStorage.setItem(key, JSON.stringify({ at: Date.now(), data })); } catch(_){ /* localStorage indisponível ou cheio: só deixa de cachear */ }
+async function idbSet_(chave, valor){
+  try{
+    const db = await idbAbrir_(); if(!db) return;
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_LOJA_, "readwrite");
+      tx.objectStore(IDB_LOJA_).put(valor, chave);
+      tx.oncomplete = resolve; tx.onerror = resolve; tx.onabort = resolve;
+    });
+  } catch(_){}
+}
+// Limpa os caches antigos do localStorage (liberam espaço para os outros apps).
+(function limparCachesAntigos_(){
+  try{ ["dbvohub_archive_recent_cache_v2","dbvohub_archive_recent_cache_v3","dbvohub_archive_full_cache_v2"].forEach((k) => localStorage.removeItem(k)); }catch(_){}
+})();
+function chaveArquivo_(){ return "arquivo_" + ARQUIVO_VERSAO_ + "_" + (state.user ? state.user.id : "anon") + (state.isMaster ? "_m" : "_p"); }
+function ehArquivada_(r){ return r && (r.status === "concluida" || r.status === "cancelada"); }
+let __arquivoMemoria = null; // { chave, itens:{id:doc}, builtAt, syncedAt }
+async function lerArquivo_(){
+  const chave = chaveArquivo_();
+  if(__arquivoMemoria && __arquivoMemoria.chave === chave) return __arquivoMemoria;
+  const salvo = await idbGet_(chave);
+  __arquivoMemoria = (salvo && salvo.itens) ? Object.assign({ chave }, salvo) : null;
+  return __arquivoMemoria;
+}
+function gravarArquivo_(arq){
+  __arquivoMemoria = arq;
+  idbSet_(arq.chave, { itens: arq.itens, builtAt: arq.builtAt, syncedAt: arq.syncedAt, ativas: arq.ativas || [] });
+}
+function idsAtivasAgora_(){ return state.requests.filter((r) => !ehArquivada_(r)).map((r) => r.id); }
+async function montarArquivo_(){
+  const agora = Date.now();
+  const chave = chaveArquivo_();
+  let arq = await lerArquivo_();
+  if(state.isMaster){
+    if(arq && agora - arq.builtAt < ARQUIVO_RECONSTRUIR_MASTER_MS){
+      // Incremental: só o que mudou de data de conclusão desde a última vez.
+      const desde = new Date((arq.syncedAt || arq.builtAt) - ARQUIVO_MARGEM_MS).toISOString();
+      const { data, error } = await sb.from("requests").select("*").gte("completed_at", desde);
+      if(!error){
+        (data || []).forEach((r) => { if(ehArquivada_(r)) arq.itens[r.id] = r; else delete arq.itens[r.id]; });
+        arq.syncedAt = agora;
+        gravarArquivo_(arq);
+      }
+      return Object.values(arq.itens);
+    }
+    const [concluidas, canceladas] = await Promise.all([
+      sb.from("requests").select("*").eq("status","concluida"),
+      sb.from("requests").select("*").eq("status","cancelada"),
+    ]);
+    if(concluidas.error || canceladas.error) return arq ? Object.values(arq.itens) : []; // não grava cache vazio
+    const itens = {};
+    [...(concluidas.data||[]), ...(canceladas.data||[])].forEach((r) => { itens[r.id] = r; });
+    gravarArquivo_({ chave, itens, builtAt: agora, syncedAt: agora });
+    return Object.values(itens);
+  }
+  // Quem não é master: só o próprio histórico (como responsável ou solicitante).
+  if(arq && agora - arq.builtAt < ARQUIVO_VALIDADE_PESSOAL_MS){
+    // Solicitações que estavam ativas na última visita e não vieram agora
+    // foram concluídas/canceladas (ou passadas para outra pessoa). Busca só
+    // essas, uma a uma, para o histórico não ficar desatualizado.
+    const agoraAtivas = new Set(idsAtivasAgora_());
+    const sumidas = (arq.ativas || []).filter((id) => !agoraAtivas.has(id) && !arq.itens[id]).slice(0, 50);
+    const uid = state.user.id;
+    for(const id of sumidas){
+      const { data } = await sb.from("requests").select("*").eq("id", id).maybeSingle();
+      if(data && ehArquivada_(data) && (data.assignee_id === uid || data.requester_id === uid)) arq.itens[id] = data;
+    }
+    arq.ativas = [...agoraAtivas];
+    gravarArquivo_(arq);
+    return Object.values(arq.itens);
+  }
+  const uid = state.user.id;
+  const consultas = await Promise.all([
+    sb.from("requests").select("*").eq("assignee_id", uid).eq("status","concluida"),
+    sb.from("requests").select("*").eq("assignee_id", uid).eq("status","cancelada"),
+    sb.from("requests").select("*").eq("requester_id", uid).eq("status","concluida"),
+    sb.from("requests").select("*").eq("requester_id", uid).eq("status","cancelada"),
+  ]);
+  if(consultas.some((c) => c.error)) return arq ? Object.values(arq.itens) : [];
+  const itens = {};
+  consultas.forEach((c) => (c.data || []).forEach((r) => { itens[r.id] = r; }));
+  gravarArquivo_({ chave, itens, builtAt: agora, syncedAt: agora, ativas: idsAtivasAgora_() });
+  return Object.values(itens);
 }
 function mergeIntoRequests_(lista){
   const existentes = new Set(state.requests.map((r) => r.id));
   lista.forEach((r) => { if(!existentes.has(r.id)){ state.requests.push(r); existentes.add(r.id); } });
 }
-async function ensureArchiveLoaded(){
-  if(state.requestsArchiveLoaded || state.requestsArchiveLoading) return;
-  state.requestsArchiveLoading = true;
-  let arquivo = readCache_(ARCHIVE_CACHE_KEY);
-  if(!arquivo){
-    const cutoff = new Date(Date.now() - ARCHIVE_RECENT_DAYS*86400000).toISOString();
-    if(state.isMaster){
-      // Uma consulta só pela data de conclusão (campo único, não exige índice
-      // composto). Antes era status == X + completed_at >= Y: essa combinação
-      // exige índice composto no Firestore e, sem ele, voltava vazia em
-      // silêncio (e o vazio ainda ficava 6h no cache).
-      const { data, error } = await sb.from("requests").select("*").gte("completed_at", cutoff);
-      if(error){
-        console.error("[arquivo] falha ao ler concluídas recentes:", error.message);
-        // Marca como carregado para NÃO ficar tentando de novo a cada tela
-        // (isso estouraria a cota), mas não grava cache: no próximo login tenta.
-        state.requestsArchiveLoaded = true;
-        state.requestsArchiveLoading = false;
-        return;
-      }
-      arquivo = (data||[]).filter((r) => r.status === "concluida" || r.status === "cancelada");
-    } else {
-      // Quem não é master só precisa do próprio histórico: busca por pessoa
-      // (bem menos leituras) e filtra os arquivados aqui.
-      const [comoResp, comoSolic] = await Promise.all([
-        sb.from("requests").select("*").eq("assignee_id", state.user.id),
-        sb.from("requests").select("*").eq("requester_id", state.user.id),
-      ]);
-      const vistos = new Set();
-      arquivo = [...(comoResp.data||[]), ...(comoSolic.data||[])]
-        .filter((r) => (r.status === "concluida" || r.status === "cancelada") && String(r.completed_at||"") >= cutoff)
-        .filter((r) => { if(vistos.has(r.id)) return false; vistos.add(r.id); return true; });
+// Uma única carga por vez. As duas marcações ("recente" e "completo") são
+// ligadas ANTES de qualquer espera: se uma delas ficasse desligada durante a
+// carga, cada redesenho pediria a carga de novo e voltaria na hora, num ciclo
+// que trava a aba (foi o problema de setembro).
+let __arquivoPromessa = null;
+function ensureArchiveLoaded(){
+  if(state.requestsArchiveLoaded || !state.user) return Promise.resolve();
+  if(__arquivoPromessa) return __arquivoPromessa;
+  state.requestsArchiveLoading = true; state.requestsFullArchiveLoading = true;
+  __arquivoPromessa = (async () => {
+    try{
+      mergeIntoRequests_(await montarArquivo_());
+    } catch(e){
+      console.error("[arquivo] falha ao carregar o histórico:", e);
+    } finally {
+      // Mesmo se falhar, marca como carregado para não tentar de novo a cada tela.
+      state.requestsArchiveLoaded = true; state.requestsFullArchiveLoaded = true;
+      state.requestsArchiveLoading = false; state.requestsFullArchiveLoading = false;
+      __arquivoPromessa = null;
     }
-    writeCache_(ARCHIVE_CACHE_KEY, arquivo);
-  }
-  mergeIntoRequests_(arquivo);
-  state.requestsArchiveLoaded = true;
-  state.requestsArchiveLoading = false;
+  })();
+  return __arquivoPromessa;
 }
-// Histórico completo (sem limite de data) — só quando alguém pede
-// explicitamente um período maior que os últimos ARCHIVE_RECENT_DAYS dias.
-async function ensureFullArchiveLoaded(){
-  if(state.requestsFullArchiveLoaded || state.requestsFullArchiveLoading) return;
-  state.requestsFullArchiveLoading = true; // marca antes de qualquer espera
-  await ensureArchiveLoaded(); // garante que a camada recente já está mesclada
-  let arquivo = readCache_(ARCHIVE_FULL_CACHE_KEY);
-  if(!arquivo){
-    if(state.isMaster){
-      const [concluidas, canceladas] = await Promise.all([
-        sb.from("requests").select("*").eq("status","concluida"),
-        sb.from("requests").select("*").eq("status","cancelada"),
-      ]);
-      arquivo = [...(concluidas.data||[]), ...(canceladas.data||[])];
-    } else {
-      const [comoResp, comoSolic] = await Promise.all([
-        sb.from("requests").select("*").eq("assignee_id", state.user.id),
-        sb.from("requests").select("*").eq("requester_id", state.user.id),
-      ]);
-      const vistos = new Set();
-      arquivo = [...(comoResp.data||[]), ...(comoSolic.data||[])]
-        .filter((r) => r.status === "concluida" || r.status === "cancelada")
-        .filter((r) => { if(vistos.has(r.id)) return false; vistos.add(r.id); return true; });
-    }
-    writeCache_(ARCHIVE_FULL_CACHE_KEY, arquivo);
-  }
-  mergeIntoRequests_(arquivo);
-  state.requestsFullArchiveLoaded = true;
-  state.requestsFullArchiveLoading = false;
-}
-// Se uma solicitação vira concluída/cancelada, atualiza os caches também
-// (senão um cache antigo "esconderia" essa mudança de quem está vendo ele).
+// O histórico agora é sempre completo (vem do cache), então é o mesmo carregamento.
+function ensureFullArchiveLoaded(){ return ensureArchiveLoaded(); }
+// Mantém o cache em dia quando alguém conclui/cancela/reabre nesta sessão.
 function invalidateArchiveCacheEntry_(request){
-  if(!request || (request.status !== "concluida" && request.status !== "cancelada")) return;
-  [ARCHIVE_CACHE_KEY, ARCHIVE_FULL_CACHE_KEY].forEach((key) => {
-    const cached = readCache_(key);
-    if(!cached) return;
-    const idx = cached.findIndex((r) => r.id === request.id);
-    if(idx >= 0) cached[idx] = request; else cached.push(request);
-    writeCache_(key, cached);
-  });
+  if(!request || !__arquivoMemoria) return;
+  if(ehArquivada_(request)) __arquivoMemoria.itens[request.id] = request;
+  else delete __arquivoMemoria.itens[request.id];
+  gravarArquivo_(__arquivoMemoria);
+}
+function removerDoArquivo_(id){
+  if(!__arquivoMemoria || !__arquivoMemoria.itens[id]) return;
+  delete __arquivoMemoria.itens[id];
+  gravarArquivo_(__arquivoMemoria);
 }
 async function refreshRoles(){
   if(!state.isMaster){ state.allRoles = []; return; }
@@ -1262,10 +1335,7 @@ async function excluirSolicitacao(id){
   const { error } = await sb.from("requests").delete().eq("id", id);
   if(error){ err("Somente o usuário master pode excluir solicitações."); return; }
   state.requests = state.requests.filter((r) => r.id !== id);
-  [ARCHIVE_CACHE_KEY, ARCHIVE_FULL_CACHE_KEY].forEach((key) => {
-    const cached = readCache_(key);
-    if(cached) writeCache_(key, cached.filter((r) => r.id !== id));
-  });
+  removerDoArquivo_(id);
   ok("Solicitação excluída.");
   if(route().startsWith("/solicitacao/")) go("/painel"); else render();
 }
@@ -1924,6 +1994,8 @@ async function removerTarefa(id){
 /* ============================ Detalhe da solicitação ============================ */
 async function loadDetalhe(id){
   state.detalhe.loading = true;
+  state.detalhe.carregandoId = id;
+  state.detalhe.naoEncontradoId = "";
   const [req, cmts] = await Promise.all([
     sb.from("requests").select("*").eq("id", id).single(),
     // Sem .order() aqui de propósito: filtro + ordenação juntos exigiriam um
@@ -1934,13 +2006,30 @@ async function loadDetalhe(id){
   state.detalhe.request = req.data || null;
   state.detalhe.comments = (cmts.data || []).slice()
     .sort((a,b) => String(a.created_at||"").localeCompare(String(b.created_at||"")));
-  if(cmts.error) err("Não foi possível carregar os comentários: "+cmts.error.message);
+  if(cmts.error && req.data) err("Não foi possível carregar os comentários: "+cmts.error.message);
   state.detalhe.loading = false;
+  state.detalhe.carregandoId = "";
+  // Não encontrada (excluída) ou sem permissão: guarda o id para NÃO tentar de
+  // novo a cada redesenho da tela. Antes isso virava um laço que relia o
+  // banco sem parar enquanto a aba ficasse aberta.
+  if(!req.data) state.detalhe.naoEncontradoId = id;
   render();
 }
 function viewDetalhe(id){
   const d = state.detalhe;
-  if(!d.request || d.request.id !== id){ loadDetalhe(id); return '<p class="text-sm text-muted-foreground">Carregando…</p>'; }
+  if(!d.request || d.request.id !== id){
+    if(d.naoEncontradoId === id){
+      return '<div class="rounded-xl border border-border bg-card p-8 text-center shadow-card">'+
+        '<p class="text-sm font-medium">Solicitação não encontrada.</p>'+
+        '<p class="mt-1 text-sm text-muted-foreground">Ela pode ter sido excluída, ou seu acesso não permite abri-la.</p>'+
+        '<div class="mt-4 flex justify-center gap-2">'+
+          '<button type="button" class="btn btn-ghost btn-sm" onclick="state.detalhe.naoEncontradoId=\'\';render()">Tentar de novo</button>'+
+          '<a href="#'+(podeExecutar() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm">Voltar</a>'+
+        '</div></div>';
+    }
+    if(d.carregandoId !== id) loadDetalhe(id); // só dispara uma vez por id
+    return '<p class="text-sm text-muted-foreground">Carregando…</p>';
+  }
   const r = d.request;
   // Quem pode abrir esta solicitação: master, o responsável por ela, ou quem a abriu.
   const souResponsavel = r.assignee_id === state.user.id;
@@ -2301,6 +2390,7 @@ function viewConfiguracoes(){
       '<div class="flex items-center justify-between"><div><h2 class="text-sm font-semibold">Status dos envios</h2>'+
         '<p class="mt-0.5 text-xs text-muted-foreground">Total enviado conta a partir da instalação desta versão do script.'+(provedorAtual ? ' Enviando por: <span class="font-medium text-foreground">'+esc(provedorAtual)+'</span>.' : "")+'</p></div>'+
         '<button type="button" class="btn btn-ghost btn-sm" onclick="refreshEmailStatus().then(render)">Atualizar</button></div>'+
+      '<p class="mt-3 rounded-lg border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">Leituras do banco feitas por esta aba desde que foi aberta: <span class="font-medium text-foreground">'+(window.__leituras ? window.__leituras.total.toLocaleString("pt-BR") : 0)+'</span>. A cota gratuita do Firestore é de 50.000 leituras por dia, somando todos os usuários.</p>'+
       '<div class="mt-4 overflow-x-auto"><table class="w-full text-sm">'+
         '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground">'+
           '<th class="pb-2 pr-3 font-medium">Regra</th><th class="pb-2 pr-3 font-medium">Situação</th><th class="pb-2 pr-3 font-medium">Último envio</th><th class="pb-2 pr-3 text-right font-medium">Total enviado</th><th class="pb-2 font-medium">Erro</th>'+
@@ -2783,16 +2873,22 @@ function exportCsv(){
 }
 
 /* ============================ Boot ============================ */
+// O aviso de login do Firebase chega junto com a abertura da página. Antes,
+// ele e o boot() carregavam tudo AO MESMO TEMPO (leitura em dobro a cada
+// abertura/F5). Agora o aviso só age depois do boot (login/logout de verdade).
+let __bootConcluido = false;
 async function boot(){
   const { data } = await sb.auth.getSession();
   state.user = data.session ? data.session.user : null;
   await loadCore();
+  __bootConcluido = true;
   state.ready = true;
   render();
 }
 sb.auth.onAuthStateChange((event, session) => {
+  if(!__bootConcluido) return;
   const next = session ? session.user : null;
-  if((next && next.id) !== (state.user && state.user.id)){ state.user = next; loadCore().then(render); }
+  if((next && next.id) !== (state.user && state.user.id)){ state.user = next; __arquivoMemoria = null; loadCore().then(render); }
 });
 boot();
 </script>
