@@ -568,6 +568,16 @@ const ACCESS_LEVELS = [
 const ACCESS_LEVEL_LABEL = Object.fromEntries(ACCESS_LEVELS.map((l) => [l.value, l.label]));
 function podeSolicitar(){ return ["solicitante","solicitante_solicitado","master"].includes(state.accessLevel); }
 function podeExecutar(){ return ["solicitado","solicitante_solicitado","master"].includes(state.accessLevel); }
+// ---- Equipe (quem não é master, mas pode ver e gerenciar o quadro de outras pessoas) ----
+// O master define em Cadastro de pessoas > Níveis de acesso > Equipe. Fica na
+// coleção "supervisao", documento = id do chefe, campo liderados = [ids].
+function temEquipe(){ return !state.isMaster && (state.liderados || []).length > 0; }
+function idsEquipe(){ return new Set([state.user ? state.user.id : "", ...(state.liderados || [])]); }
+function ehDaEquipe(r){
+  const lid = state.liderados || [];
+  return !!r && (lid.includes(r.assignee_id) || lid.includes(r.requester_id));
+}
+function podeVerQuadro(){ return podeExecutar() || temEquipe(); }
 function levelOf(userId){
   const r = state.allRoles.find((x) => x.user_id === userId && ACCESS_LEVELS.some((l) => l.value === x.role));
   if(r) return r.role;
@@ -581,7 +591,7 @@ function isHardcodedMaster(email){ return MASTER_EMAILS.includes(String(email||"
 const state = {
   user: null, profile: null, isMaster: false, accessLevel: "solicitante",
   theme: (document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"),
-  departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {},
+  departments: [], profiles: [], types: [], requests: [], tasks: [], pessoas: [], settings: {}, allRoles: [], emailStatus: {}, liderados: [], supervisoes: {}, equipeEdit: null,
   requestsArchiveLoaded: false, requestsArchiveLoading: false,
   requestsFullArchiveLoaded: false, requestsFullArchiveLoading: false,
   filters: {
@@ -621,8 +631,15 @@ async function loadCore(){
     state.nivelLeituraFalhou = leituraFalhou && !nivelSalvo;
   }
 
+  // 1b) Equipe liberada para esta pessoa (só faz sentido para quem não é master).
+  state.liderados = [];
+  if(state.user && !state.isMaster){
+    const sup = await sb.from("supervisao").select("*").eq("id", state.user.id).maybeSingle();
+    state.liderados = ((sup.data && sup.data.liderados) || []).filter((id) => id && id !== state.user.id);
+  }
+
   // 2) Solicitações ativas: master vê todas; os demais recebem só as suas
-  //    (as que são responsáveis e as que abriram).
+  //    (as que são responsáveis e as que abriram) e as da equipe liberada.
   const buscarAtivas = () => {
     if(state.isMaster || !state.user){
       return Promise.all(ACTIVE_STATUSES.map((s) => sb.from("requests").select("*").eq("status", s)));
@@ -630,11 +647,11 @@ async function loadCore(){
     // Só as ATIVAS de quem é responsável ou solicitante. Duas igualdades na
     // mesma consulta não exigem índice composto. Antes vinha o histórico
     // inteiro da pessoa a cada abertura da página.
-    const uid = state.user.id;
-    return Promise.all(ACTIVE_STATUSES.flatMap((st) => [
+    const uids = [...idsEquipe()];
+    return Promise.all(uids.flatMap((uid) => ACTIVE_STATUSES.flatMap((st) => [
       sb.from("requests").select("*").eq("assignee_id", uid).eq("status", st),
       sb.from("requests").select("*").eq("requester_id", uid).eq("status", st),
-    ]));
+    ])));
   };
 
   const [deps, profs, types, activeReqs, pessoas, settings] = await Promise.all([
@@ -687,7 +704,7 @@ async function loadCore(){
   if(state.user){
     await refreshTasks();
     await refreshRoles();
-    if(state.isMaster) await refreshEmailStatus();
+    if(state.isMaster){ await refreshEmailStatus(); await refreshSupervisoes(); }
   }
 }
 // ===================== Histórico (concluídas/canceladas) =====================
@@ -745,7 +762,11 @@ async function idbSet_(chave, valor){
 (function limparCachesAntigos_(){
   try{ ["dbvohub_archive_recent_cache_v2","dbvohub_archive_recent_cache_v3","dbvohub_archive_full_cache_v2"].forEach((k) => localStorage.removeItem(k)); }catch(_){}
 })();
-function chaveArquivo_(){ return "arquivo_" + ARQUIVO_VERSAO_ + "_" + (state.user ? state.user.id : "anon") + (state.isMaster ? "_m" : "_p"); }
+function chaveArquivo_(){
+  // A equipe entra na chave: se o master mudar quem a pessoa vê, o cache é refeito.
+  const eq = state.isMaster ? "" : [...(state.liderados || [])].sort().join(",");
+  return "arquivo_" + ARQUIVO_VERSAO_ + "_" + (state.user ? state.user.id : "anon") + (state.isMaster ? "_m" : "_p") + (eq ? "_e" + eq.length + "_" + eq.slice(-40) : "");
+}
 function ehArquivada_(r){ return r && (r.status === "concluida" || r.status === "cancelada"); }
 let __arquivoMemoria = null; // { chave, itens:{id:doc}, builtAt, syncedAt }
 async function lerArquivo_(){
@@ -793,22 +814,21 @@ async function montarArquivo_(){
     // essas, uma a uma, para o histórico não ficar desatualizado.
     const agoraAtivas = new Set(idsAtivasAgora_());
     const sumidas = (arq.ativas || []).filter((id) => !agoraAtivas.has(id) && !arq.itens[id]).slice(0, 50);
-    const uid = state.user.id;
+    const meus = idsEquipe();
     for(const id of sumidas){
       const { data } = await sb.from("requests").select("*").eq("id", id).maybeSingle();
-      if(data && ehArquivada_(data) && (data.assignee_id === uid || data.requester_id === uid)) arq.itens[id] = data;
+      if(data && ehArquivada_(data) && (meus.has(data.assignee_id) || meus.has(data.requester_id))) arq.itens[id] = data;
     }
     arq.ativas = [...agoraAtivas];
     gravarArquivo_(arq);
     return Object.values(arq.itens);
   }
-  const uid = state.user.id;
-  const consultas = await Promise.all([
+  const consultas = await Promise.all([...idsEquipe()].flatMap((uid) => [
     sb.from("requests").select("*").eq("assignee_id", uid).eq("status","concluida"),
     sb.from("requests").select("*").eq("assignee_id", uid).eq("status","cancelada"),
     sb.from("requests").select("*").eq("requester_id", uid).eq("status","concluida"),
     sb.from("requests").select("*").eq("requester_id", uid).eq("status","cancelada"),
-  ]);
+  ]));
   if(consultas.some((c) => c.error)) return arq ? Object.values(arq.itens) : [];
   const itens = {};
   consultas.forEach((c) => (c.data || []).forEach((r) => { itens[r.id] = r; }));
@@ -855,6 +875,11 @@ function removerDoArquivo_(id){
   if(!__arquivoMemoria || !__arquivoMemoria.itens[id]) return;
   delete __arquivoMemoria.itens[id];
   gravarArquivo_(__arquivoMemoria);
+}
+async function refreshSupervisoes(){
+  if(!state.isMaster){ state.supervisoes = {}; return; }
+  const { data } = await sb.from("supervisao").select("*");
+  state.supervisoes = Object.fromEntries((data || []).map((d) => [d.id, (d.liderados || [])]));
 }
 async function refreshRoles(){
   if(!state.isMaster){ state.allRoles = []; return; }
@@ -980,7 +1005,7 @@ async function render(){
 
   // Tela inicial conforme o nível: quem só solicita cai em Acompanhamento,
   // quem executa cai no Quadro.
-  const telaInicial = () => podeExecutar() ? "/painel" : (podeSolicitar() ? "/acompanhamento" : "/agenda");
+  const telaInicial = () => podeVerQuadro() ? "/painel" : (podeSolicitar() ? "/acompanhamento" : "/agenda");
   const semAcesso = (msg) => '<div class="rounded-xl border border-border bg-card p-8 text-center shadow-card">'+
     '<p class="text-sm text-muted-foreground">'+msg+'</p>'+
     '<a href="#'+telaInicial()+'" class="btn btn-outline btn-sm mt-4">Ir para minha tela inicial</a></div>';
@@ -1003,7 +1028,7 @@ async function render(){
   )){
     ensureFullArchiveLoaded().then(render);
   }
-  if(path.startsWith("/painel")) inner = podeExecutar() ? viewPainel() : semAcesso("Seu acesso não inclui o quadro de execução. Acompanhe suas solicitações na aba Acompanhamento.");
+  if(path.startsWith("/painel")) inner = podeVerQuadro() ? viewPainel() : semAcesso("Seu acesso não inclui o quadro de execução. Acompanhe suas solicitações na aba Acompanhamento.");
   else if(path.startsWith("/nova")) inner = podeSolicitar() ? viewNova() : semAcesso("Seu acesso não permite abrir novas solicitações.");
   else if(path.startsWith("/agenda")) inner = viewAgenda();
   else if(path.startsWith("/acompanhamento")) inner = podeSolicitar() ? viewAcompanhamento() : semAcesso("Seu acesso não inclui o acompanhamento de solicitações abertas por você.");
@@ -1037,7 +1062,7 @@ async function render(){
 /* ============================ Shell ============================ */
 function navParaNivel(){
   const itens = [{ to:"/agenda", label:"Minha agenda", icon:I.calendarDays }];
-  if(podeExecutar()) itens.push({ to:"/painel", label:"Quadro", icon:I.layout });
+  if(podeVerQuadro()) itens.push({ to:"/painel", label:"Quadro", icon:I.layout });
   if(podeSolicitar()){
     itens.push({ to:"/acompanhamento", label:"Acompanhamento", icon:I.clipboardCheck });
     itens.push({ to:"/nova", label:"Nova solicitação", icon:I.plus });
@@ -1078,7 +1103,7 @@ function shell(children, path){
   return '<div class="min-h-screen bg-background">'+
     '<header class="sticky top-0 z-30 border-b border-border bg-card/90 backdrop-blur">'+
       '<div class="mx-auto flex h-16 max-w-[1400px] items-center gap-4 px-4 sm:px-6">'+
-        '<a href="#'+(podeExecutar()?"/painel":"/acompanhamento")+'" class="logo-mark shrink-0">'+(state.theme === "dark" ? LOGO_SVG_WHITE : LOGO_SVG)+'</a>'+
+        '<a href="#'+(podeVerQuadro()?"/painel":"/acompanhamento")+'" class="logo-mark shrink-0">'+(state.theme === "dark" ? LOGO_SVG_WHITE : LOGO_SVG)+'</a>'+
         '<nav class="ml-auto flex items-center gap-0.5">'+nav+adminMenu+
           '<button class="btn btn-ghost btn-sm" title="'+(state.theme === "dark" ? "Mudar para o modo claro" : "Mudar para o modo escuro")+'" onclick="alternarTema()">'+
             (state.theme === "dark" ? I.sun : I.moon)+'</button>'+
@@ -1210,8 +1235,12 @@ async function signOut(){ await sb.auth.signOut(); state.user = null; state.task
 function filteredRequests(){
   const f = state.filters;
   let list = state.requests;
-  // Quem não é master vê no quadro apenas as solicitações sob sua responsabilidade.
-  if(!state.isMaster) list = list.filter((r) => r.assignee_id === state.user.id);
+  // Quem não é master vê no quadro as solicitações sob sua responsabilidade e,
+  // se tiver equipe liberada, também as que estão com as pessoas da equipe.
+  if(!state.isMaster){
+    const eq = idsEquipe();
+    list = list.filter((r) => eq.has(r.assignee_id));
+  }
   if(f.painelDep !== "todos") list = list.filter((r) => r.target_department_id === f.painelDep || r.requester_department_id === f.painelDep);
   if(f.painelPeriod === "custom"){
     // Filtra pela data de abertura, como os demais períodos.
@@ -1241,8 +1270,13 @@ function viewPainel(){
   const tags = [...new Set(state.types.map((t) => t.tag).filter(Boolean))];
   const tagOpts = '<option value="todos">Todos os rótulos</option>'+
     tags.map((t) => '<option value="'+esc(t)+'"'+(t===state.filters.painelTag?" selected":"")+'>'+esc(t)+'</option>').join("");
-  const assigneeOpts = '<option value="todos">Todos os responsáveis</option><option value="sem"'+(state.filters.painelAssignee==="sem"?" selected":"")+'>Sem responsável</option>'+
-    state.profiles.map((p) => '<option value="'+p.id+'"'+(p.id===state.filters.painelAssignee?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("");
+  const assigneeOpts = state.isMaster
+    ? '<option value="todos">Todos os responsáveis</option><option value="sem"'+(state.filters.painelAssignee==="sem"?" selected":"")+'>Sem responsável</option>'+
+      state.profiles.map((p) => '<option value="'+p.id+'"'+(p.id===state.filters.painelAssignee?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("")
+    : '<option value="todos">Eu e minha equipe</option>'+
+      '<option value="'+state.user.id+'"'+(state.filters.painelAssignee===state.user.id?" selected":"")+'>Só eu</option>'+
+      state.profiles.filter((p) => (state.liderados || []).includes(p.id))
+        .map((p) => '<option value="'+p.id+'"'+(p.id===state.filters.painelAssignee?" selected":"")+'>'+esc(p.full_name||p.email)+'</option>').join("");
   const filterBar = '<div class="mt-4 flex flex-wrap items-center gap-2">'+
     '<div class="relative w-56"><span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
       '<input id="painelSearchInput" class="inp pl-8" placeholder="Buscar por número (#0001)" value="'+esc(state.filters.painelSearch)+'" oninput="debouncedFilter(\'painelSearch\',this.value)" /></div>'+
@@ -1256,7 +1290,7 @@ function viewPainel(){
         '</div>'
       : "")+
     '<select class="inp w-48" onchange="state.filters.painelTag=this.value;render()">'+tagOpts+'</select>'+
-    (state.isMaster ? '<select class="inp w-56" onchange="state.filters.painelAssignee=this.value;render()">'+assigneeOpts+'</select>' : "")+
+    ((state.isMaster || temEquipe()) ? '<select class="inp w-56" aria-label="Responsável" onchange="state.filters.painelAssignee=this.value;render()">'+assigneeOpts+'</select>' : "")+
   '</div>';
   const CARDS_PER_COLUMN = 40;
   const columns = STATUS_ORDER.map((status) => {
@@ -1393,9 +1427,14 @@ function balaoTicket(r, tipo){
 }
 function viewAcompanhamento(){
   const status = state.filters.acompStatus;
-  // Master pode ver o acompanhamento de outra pessoa ("" = o próprio, "todas" = todo mundo).
-  const alvo = state.isMaster ? (state.filters.acompUser || "") : "";
-  const doAlvo = (r) => alvo === "todas" ? true : r.requester_id === (alvo || state.user.id);
+  // Master vê o acompanhamento de qualquer pessoa; quem tem equipe liberada vê
+  // o da equipe ("" = o próprio, "todas" = todo mundo / toda a equipe).
+  const podeEscolher = state.isMaster || temEquipe();
+  let alvo = podeEscolher ? (state.filters.acompUser || "") : "";
+  if(!state.isMaster && alvo && alvo !== "todas" && !(state.liderados || []).includes(alvo)) alvo = "";
+  const doAlvo = (r) => alvo === "todas"
+    ? (state.isMaster ? true : idsEquipe().has(r.requester_id))
+    : r.requester_id === (alvo || state.user.id);
   const vendoOutro = !!alvo;
   let mine = state.requests.filter(doAlvo);
   const total = mine.length;
@@ -1409,8 +1448,8 @@ function viewAcompanhamento(){
   mine = mine.slice().sort((a,b) => new Date(b.created_at) - new Date(a.created_at));
   const meusTipos = [...new Set(state.requests.filter(doAlvo).map((r) => r.request_type_id || ""))];
   const pessoaOpts = '<option value="">Minhas solicitações</option>'+
-    '<option value="todas"'+(alvo==="todas"?" selected":"")+'>Todas as pessoas</option>'+
-    state.profiles.filter((pr) => pr.id !== state.user.id)
+    '<option value="todas"'+(alvo==="todas"?" selected":"")+'>'+(state.isMaster ? "Todas as pessoas" : "Eu e minha equipe")+'</option>'+
+    state.profiles.filter((pr) => pr.id !== state.user.id && (state.isMaster || (state.liderados || []).includes(pr.id)))
       .map((pr) => '<option value="'+pr.id+'"'+(pr.id===alvo?" selected":"")+'>'+esc(pr.full_name || pr.email)+'</option>').join("");
   const typeOpts = '<option value="todos">Todos os tipos</option>'+
     meusTipos.map((id) => ({ id, nome: id ? ((state.types.find((t) => t.id === id)||{}).name || "Tipo removido") : "Sem tipo" }))
@@ -1452,12 +1491,12 @@ function viewAcompanhamento(){
 
   return '<div class="mx-auto max-w-4xl">'+
     '<div class="flex flex-wrap items-end justify-between gap-4">'+
-      '<div><h1 class="text-3xl font-bold">'+(alvo === "todas" ? "Acompanhamento geral" : vendoOutro ? "Acompanhamento de "+esc(nameById(alvo)) : "Acompanhamento")+'</h1>'+
-      '<p class="mt-1 text-sm text-muted-foreground">'+(alvo === "todas" ? "Solicitações abertas por todas as pessoas." : vendoOutro ? "Solicitações que essa pessoa abriu e o andamento de cada uma." : "Solicitações que você abriu e o andamento de cada uma.")+'</p></div>'+
+      '<div><h1 class="text-3xl font-bold">'+(alvo === "todas" ? (state.isMaster ? "Acompanhamento geral" : "Acompanhamento da equipe") : vendoOutro ? "Acompanhamento de "+esc(nameById(alvo)) : "Acompanhamento")+'</h1>'+
+      '<p class="mt-1 text-sm text-muted-foreground">'+(alvo === "todas" ? (state.isMaster ? "Solicitações abertas por todas as pessoas." : "Solicitações abertas por você e pela sua equipe.") : vendoOutro ? "Solicitações que essa pessoa abriu e o andamento de cada uma." : "Solicitações que você abriu e o andamento de cada uma.")+'</p></div>'+
       '<div class="flex flex-wrap items-center gap-2">'+
         '<div class="relative w-64"><span class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground">'+I.search+'</span>'+
           '<input id="acompSearchInput" class="inp pl-8" placeholder="Buscar: nome, CNPJ, nº…" value="'+esc(state.filters.acompSearch)+'" oninput="debouncedFilter(\'acompSearch\',this.value)" /></div>'+
-        (state.isMaster ? '<select class="inp w-56" aria-label="De quem" onchange="state.filters.acompUser=this.value;state.filters.acompType=\'todos\';state.painelExpanded.__acomp=false;render()">'+pessoaOpts+'</select>' : "")+
+        (podeEscolher ? '<select class="inp w-56" aria-label="De quem" onchange="state.filters.acompUser=this.value;state.filters.acompType=\'todos\';state.painelExpanded.__acomp=false;render()">'+pessoaOpts+'</select>' : "")+
         '<select class="inp w-52" onchange="state.filters.acompType=this.value;render()">'+typeOpts+'</select>'+
         '<select class="inp w-48" onchange="state.filters.acompStatus=this.value;render()">'+statusTabs+'</select>'+
       '</div>'+
@@ -2024,7 +2063,7 @@ function viewDetalhe(id){
         '<p class="mt-1 text-sm text-muted-foreground">Ela pode ter sido excluída, ou seu acesso não permite abri-la.</p>'+
         '<div class="mt-4 flex justify-center gap-2">'+
           '<button type="button" class="btn btn-ghost btn-sm" onclick="state.detalhe.naoEncontradoId=\'\';render()">Tentar de novo</button>'+
-          '<a href="#'+(podeExecutar() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm">Voltar</a>'+
+          '<a href="#'+(podeVerQuadro() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm">Voltar</a>'+
         '</div></div>';
     }
     if(d.carregandoId !== id) loadDetalhe(id); // só dispara uma vez por id
@@ -2034,14 +2073,16 @@ function viewDetalhe(id){
   // Quem pode abrir esta solicitação: master, o responsável por ela, ou quem a abriu.
   const souResponsavel = r.assignee_id === state.user.id;
   const souSolicitante = r.requester_id === state.user.id;
-  if(!state.isMaster && !souResponsavel && !souSolicitante){
+  const daEquipe = ehDaEquipe(r);
+  if(!state.isMaster && !souResponsavel && !souSolicitante && !daEquipe){
     return '<div class="rounded-xl border border-border bg-card p-8 text-center shadow-card">'+
       '<p class="text-sm text-muted-foreground">Esta solicitação não está sob sua responsabilidade e não foi aberta por você.</p>'+
-      '<a href="#'+(podeExecutar() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm mt-4">Voltar</a></div>';
+      '<a href="#'+(podeVerQuadro() ? "/painel" : "/acompanhamento")+'" class="btn btn-outline btn-sm mt-4">Voltar</a></div>';
   }
   // Só quem executa (ou master) altera status/responsável/prazo; solicitante
   // acompanha e comenta, mas não muda o andamento.
-  const podeEditar = state.isMaster || (podeExecutar() && souResponsavel);
+  // Quem tem a pessoa na equipe liberada mexe no card como o próprio responsável.
+  const podeEditar = state.isMaster || (podeExecutar() && souResponsavel) || daEquipe;
   // O solicitante pode cancelar a própria solicitação enquanto ela não estiver
   // concluída ou já cancelada (mesmo sem poder mexer no resto do andamento).
   const podeCancelar = !podeEditar && souSolicitante && r.status !== "concluida" && r.status !== "cancelada";
@@ -2079,7 +2120,7 @@ function viewDetalhe(id){
     : '<p class="text-sm text-muted-foreground">Nenhum registro ainda.</p>';
 
   return '<div class="mx-auto max-w-5xl">'+
-    '<a href="#'+(podeExecutar()?"/painel":"/acompanhamento")+'" class="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">'+I.arrowLeft+(podeExecutar()?' Voltar ao quadro':' Voltar ao acompanhamento')+'</a>'+
+    '<a href="#'+(podeVerQuadro()?"/painel":"/acompanhamento")+'" class="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">'+I.arrowLeft+(podeVerQuadro()?' Voltar ao quadro':' Voltar ao acompanhamento')+'</a>'+
     '<div class="mt-4 flex flex-wrap items-center gap-3">'+
       '<span class="font-mono text-sm text-muted-foreground">#'+pad4(r.code)+'</span>'+
       '<span class="inline-flex items-center gap-2 rounded-full border border-border bg-card px-3 py-1 text-xs font-medium"><span class="size-2 rounded-full '+STATUS_DOT[r.status]+'"></span>'+STATUS_LABEL[r.status]+'</span>'+
@@ -2521,8 +2562,9 @@ function viewPessoas(){
       '<p class="mt-1 text-xs text-muted-foreground">'+
         ACCESS_LEVELS.map((l) => '<strong>'+l.label+':</strong> '+l.desc).join(' · ')+
         '. Quem ainda não tem nível definido entra como Solicitante. E-mails marcados como "fixo no código" são master pelo próprio arquivo do app, mesmo sem registro no banco.</p>'+
+      '<p class="mt-2 text-xs text-muted-foreground"><strong>Equipe:</strong> para quem não é master, escolha de quais pessoas ela pode ver e gerenciar o Quadro e o Acompanhamento (ex.: o gestor e os liderados). Ela mexe nos cards dessas pessoas como o próprio responsável, mas continua sem acesso a cadastros, tipos, relatórios e configurações.</p>'+
       '<div class="mt-4 overflow-x-auto"><table class="w-full text-sm">'+
-        '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground"><th class="pb-2 font-medium">Pessoa</th><th class="pb-2 font-medium">Nível de acesso</th></tr></thead>'+
+        '<thead><tr class="border-b border-border text-left text-xs text-muted-foreground"><th class="pb-2 font-medium">Pessoa</th><th class="pb-2 font-medium">Nível de acesso</th><th class="pb-2 font-medium" title="Pessoas cujo quadro e acompanhamento esta pessoa pode ver e gerenciar">Equipe (vê e gerencia)</th></tr></thead>'+
         '<tbody>'+state.profiles.map((pr) => {
           const nivel = levelOf(pr.id);
           const travado = pr.id === state.user.id || isHardcodedMaster(pr.email);
@@ -2536,7 +2578,9 @@ function viewPessoas(){
               ? '<span class="rounded-full bg-secondary px-2.5 py-1 text-xs" title="'+motivo+'">'+ACCESS_LEVEL_LABEL[nivel]+'</span>'+
                 (isHardcodedMaster(pr.email) ? '<span class="ml-1 text-[10px] text-muted-foreground">(fixo no código)</span>' : '<span class="ml-1 text-[10px] text-muted-foreground">(você)</span>')
               : '<select class="inp w-56" onchange="definirNivelAcesso(\''+pr.id+'\',this.value)">'+opts+'</select>')+
-          '</td></tr>';
+          '</td>'+
+          '<td class="py-2">'+celulaEquipe(pr, nivel)+'</td></tr>'+
+          (state.equipeEdit && state.equipeEdit.chefeId === pr.id ? '<tr><td colspan="3" class="pb-3">'+editorEquipe(pr)+'</td></tr>' : "");
         }).join("")+
         '</tbody></table></div>'+
     '</section>'+
@@ -2556,6 +2600,59 @@ function viewPessoas(){
       '<button type="button" class="btn btn-outline mt-4" onclick="mesclarPerfis(document.getElementById(\'mesclarManter\').value, document.getElementById(\'mesclarRemover\').value)">Mesclar perfis</button>'+
     '</section>'+
   '</div>';
+}
+// ---- Equipe: editor no cadastro ----
+function celulaEquipe(pr, nivel){
+  if(nivel === "master" || isHardcodedMaster(pr.email)) return '<span class="text-xs text-muted-foreground">Vê tudo (master)</span>';
+  const ids = state.supervisoes[pr.id] || [];
+  const nomes = ids.map((id) => nameById(id)).filter(Boolean);
+  const resumo = nomes.length
+    ? '<span class="text-xs">'+esc(nomes.slice(0,3).join(", "))+(nomes.length > 3 ? ' <span class="text-muted-foreground">+'+(nomes.length-3)+'</span>' : "")+'</span>'
+    : '<span class="text-xs text-muted-foreground">Só a própria</span>';
+  return '<div class="flex flex-wrap items-center gap-2">'+resumo+
+    '<button type="button" class="btn btn-ghost btn-sm" onclick="abrirEditorEquipe(\''+pr.id+'\')">'+(nomes.length ? "Editar" : "Definir")+'</button></div>';
+}
+function abrirEditorEquipe(chefeId){
+  state.equipeEdit = { chefeId, selecionados: [...(state.supervisoes[chefeId] || [])], busca: "" };
+  render();
+}
+function editorEquipe(chefe){
+  const e = state.equipeEdit;
+  const busca = (e.busca || "").trim().toLowerCase();
+  const candidatos = state.profiles.filter((p) => p.id !== chefe.id)
+    .filter((p) => !busca || (p.full_name||"").toLowerCase().includes(busca) || (p.email||"").toLowerCase().includes(busca));
+  return '<div class="rounded-lg border border-border bg-surface p-4">'+
+    '<p class="text-xs font-medium">Equipe de '+esc(chefe.full_name || chefe.email)+': marque as pessoas cujo quadro e acompanhamento ela vai ver e gerenciar.</p>'+
+    '<input id="equipeBuscaInput" class="inp mt-3" placeholder="Buscar pessoa" value="'+esc(e.busca||"")+'" oninput="state.equipeEdit.busca=this.value;clearTimeout(window.__eqT);window.__eqT=setTimeout(render,250)" />'+
+    '<div class="mt-3 grid max-h-64 gap-1 overflow-y-auto sm:grid-cols-2">'+
+      candidatos.map((p) => '<label class="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm hover:bg-card">'+
+        '<input type="checkbox" '+(e.selecionados.includes(p.id) ? "checked" : "")+' onchange="alternarLiderado(\''+p.id+'\',this.checked)" />'+
+        '<span>'+esc(p.full_name || p.email)+'</span></label>').join("")+
+    '</div>'+
+    '<div class="mt-3 flex items-center justify-between gap-2">'+
+      '<span class="text-xs text-muted-foreground">'+e.selecionados.length+' pessoa(s) selecionada(s)</span>'+
+      '<div class="flex gap-2"><button type="button" class="btn btn-ghost btn-sm" onclick="state.equipeEdit=null;render()">Cancelar</button>'+
+      '<button type="button" class="btn btn-primary btn-sm" onclick="salvarEquipe()">Salvar equipe</button></div>'+
+    '</div></div>';
+}
+function alternarLiderado(id, marcado){
+  const sel = state.equipeEdit.selecionados;
+  const i = sel.indexOf(id);
+  if(marcado && i < 0) sel.push(id);
+  if(!marcado && i >= 0) sel.splice(i, 1);
+  render();
+}
+async function salvarEquipe(){
+  const e = state.equipeEdit; if(!e) return;
+  const liderados = e.selecionados.filter((id) => id !== e.chefeId);
+  const { error } = liderados.length
+    ? await sb.from("supervisao").upsert({ id: e.chefeId, liderados, updated_at: new Date().toISOString(), updated_by: state.user.id })
+    : await sb.from("supervisao").delete().eq("id", e.chefeId);
+  if(error){ err("Não foi possível salvar a equipe: "+error.message); return; }
+  state.equipeEdit = null;
+  await refreshSupervisoes();
+  ok("Equipe salva. A pessoa vê a mudança na próxima vez que abrir ou recarregar a Central.");
+  render();
 }
 let __pessoaBuscaTimer = null;
 function debouncedPessoaBusca(valor){
